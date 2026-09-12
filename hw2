@@ -1,1 +1,68 @@
+ #include "MiniFB.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+extern "C" {
+#include "microui.h"
+}
+
+#include "ui_bridge.h"
+#include "ui_renderer.h"
+
+#define WIDTH 1600
+#define HEIGHT 1200
+
+constexpr int UI_WIDTH = 440;
+constexpr float SCREEN_MODEL_SCALE = 140.0f;
+
+static uint32_t g_buffer[WIDTH * HEIGHT];
+
+// ============================================================
+// Data structures
+// ============================================================
+
+struct Face {
+    int a = 0;
+    int b = 0;
+    int c = 0;
+};
+
+struct TransformState {
+    glm::vec3 local_translation{0.0f, 0.0f, 0.0f};
+    glm::vec3 local_rotation{0.0f, 0.0f, 0.0f};
+    glm::vec3 local_scale{1.0f, 1.0f, 1.0f};
+
+    glm::vec3 world_translation{0.0f, 0.0f, 0.0f};
+    glm::vec3 world_rotation{0.0f, 0.0f, 0.0f};
+    glm::vec3 world_scale{1.0f, 1.0f, 1.0f};
+};
+
+struct Mesh {
+    std::string name;
+    std::string filename;
+
+    std::vector<glm::vec3> vertices;
+    std::vector<Face> faces;
+
+    glm::vec3 minimum{0.0f};
+    glm::vec3 maximum{0.0f};
+    glm::vec3 center{0.0f};
+
+    float normalization_scale = 1.0f;
+
+    TransformState transform;
+    uint32_t color = MFB_RGB(255, 255, 255);
+};
