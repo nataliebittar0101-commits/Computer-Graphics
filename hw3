@@ -1,0 +1,28 @@
+#include "MiniFB.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+extern "C" {
+#include "microui.h"
+}
+
+#include "ui_bridge.h"
+#include "ui_renderer.h"
+
+#define WIDTH 1600
+#define HEIGHT 1200
