@@ -1,0 +1,33 @@
+#include "MiniFB.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+extern "C" {
+#include "microui.h"
+}
+
+#include "ui_bridge.h"
+#include "ui_renderer.h"
+
+#define WIDTH 1600
+#define HEIGHT 1200
+
+constexpr int UI_WIDTH = 445;
+constexpr float EPSILON = 0.00001f;
+
+static uint32_t g_buffer[WIDTH * HEIGHT];
+static float g_z_buffer[WIDTH * HEIGHT];
