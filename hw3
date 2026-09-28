@@ -560,4 +560,209 @@ glm::mat4 create_model_matrix(
     return create_local_world_matrix(mesh) *
            normalization;
 }
-         
+   // ============================================================
+// Camera and projection
+// ============================================================
+
+glm::mat4 create_view_matrix(
+    const Camera &camera) {
+
+    if (camera.use_look_at) {
+        glm::vec3 forward =
+            camera.target -
+            camera.position;
+
+        if (glm::length(forward) < 0.0001f) {
+            forward =
+                glm::vec3(
+                    0.0f,
+                    0.0f,
+                    -1.0f);
+        }
+
+        return glm::lookAt(
+            camera.position,
+            camera.target,
+            glm::vec3(0.0f, 1.0f, 0.0f));
+    }
+
+    glm::mat4 camera_transform(1.0f);
+
+    camera_transform =
+        glm::translate(
+            camera_transform,
+            camera.position);
+
+    camera_transform *=
+        create_rotation_matrix(
+            camera.rotation);
+
+    return glm::inverse(camera_transform);
+}
+
+glm::mat4 create_projection_matrix(
+    const Camera &camera) {
+
+    float viewport_width =
+        static_cast<float>(
+            WIDTH - UI_WIDTH);
+
+    float viewport_height =
+        static_cast<float>(HEIGHT);
+
+    float aspect_ratio =
+        viewport_width / viewport_height;
+
+    if (camera.use_perspective) {
+        return glm::perspective(
+            glm::radians(
+                camera.field_of_view),
+            aspect_ratio,
+            camera.near_plane,
+            camera.far_plane);
+    }
+
+    constexpr float ortho_height = 3.4f;
+    float ortho_width =
+        ortho_height * aspect_ratio;
+
+    return glm::ortho(
+        -ortho_width,
+        ortho_width,
+        -ortho_height,
+        ortho_height,
+        camera.near_plane,
+        camera.far_plane);
+}
+
+void apply_dolly_zoom(Camera &camera) {
+    if (!camera.dolly_zoom_enabled) {
+        return;
+    }
+
+    constexpr float base_distance = 7.0f;
+    constexpr float base_fov = 60.0f;
+
+    float distance =
+        base_distance +
+        camera.dolly_zoom_value;
+
+    distance =
+        std::clamp(
+            distance,
+            2.0f,
+            18.0f);
+
+    camera.position.z = distance;
+
+    float constant =
+        base_distance *
+        std::tan(
+            glm::radians(base_fov) *
+            0.5f);
+
+    float new_fov_radians =
+        2.0f *
+        std::atan(
+            constant / distance);
+
+    camera.field_of_view =
+        glm::degrees(new_fov_radians);
+
+    camera.field_of_view =
+        std::clamp(
+            camera.field_of_view,
+            15.0f,
+            110.0f);
+}
+
+// ============================================================
+// Projection helpers
+// ============================================================
+
+bool project_point(
+    const glm::vec3 &world_point,
+    const glm::mat4 &view_matrix,
+    const glm::mat4 &projection_matrix,
+    glm::ivec2 &screen_point) {
+
+    glm::vec4 clip =
+        projection_matrix *
+        view_matrix *
+        glm::vec4(world_point, 1.0f);
+
+    if (std::abs(clip.w) < 0.00001f) {
+        return false;
+    }
+
+    if (clip.w <= 0.0f) {
+        return false;
+    }
+
+    glm::vec3 ndc =
+        glm::vec3(clip) / clip.w;
+
+    if (ndc.z < -1.2f ||
+        ndc.z > 1.2f) {
+
+        return false;
+    }
+
+    int viewport_width =
+        WIDTH - UI_WIDTH;
+
+    int screen_x =
+        UI_WIDTH +
+        static_cast<int>(
+            (ndc.x * 0.5f + 0.5f) *
+            static_cast<float>(
+                viewport_width));
+
+    int screen_y =
+        static_cast<int>(
+            (1.0f -
+             (ndc.y * 0.5f + 0.5f)) *
+            static_cast<float>(HEIGHT));
+
+    screen_point =
+        glm::ivec2(screen_x, screen_y);
+
+    return true;
+}
+
+void draw_projected_line(
+    const glm::vec3 &start,
+    const glm::vec3 &end,
+    const glm::mat4 &view_matrix,
+    const glm::mat4 &projection_matrix,
+    uint32_t color) {
+
+    glm::ivec2 screen_start;
+    glm::ivec2 screen_end;
+
+    bool start_visible =
+        project_point(
+            start,
+            view_matrix,
+            projection_matrix,
+            screen_start);
+
+    bool end_visible =
+        project_point(
+            end,
+            view_matrix,
+            projection_matrix,
+            screen_end);
+
+    if (!start_visible || !end_visible) {
+        return;
+    }
+
+    draw_line_bresenham(
+        screen_start.x,
+        screen_start.y,
+        screen_end.x,
+        screen_end.y,
+        color);
+}
+      
