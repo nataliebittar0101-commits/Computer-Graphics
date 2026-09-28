@@ -26,3 +26,538 @@ extern "C" {
 
 #define WIDTH 1600
 #define HEIGHT 1200
+  constexpr int UI_WIDTH = 445;
+constexpr float PI_VALUE = 3.14159265358979323846f;
+
+static uint32_t g_buffer[WIDTH * HEIGHT];
+
+// ============================================================
+// Data structures
+// ============================================================
+
+struct Face {
+    int a = 0;
+    int b = 0;
+    int c = 0;
+};
+
+struct TransformState {
+    glm::vec3 local_translation{0.0f};
+    glm::vec3 local_rotation{0.0f};
+    glm::vec3 local_scale{1.0f};
+
+    glm::vec3 world_translation{0.0f};
+    glm::vec3 world_rotation{0.0f};
+    glm::vec3 world_scale{1.0f};
+};
+
+struct Mesh {
+    std::string name;
+    std::string filename;
+
+    std::vector<glm::vec3> vertices;
+    std::vector<Face> faces;
+
+    std::vector<glm::vec3> face_normals;
+    std::vector<glm::vec3> vertex_normals;
+
+    glm::vec3 minimum{0.0f};
+    glm::vec3 maximum{0.0f};
+    glm::vec3 center{0.0f};
+
+    float normalization_scale = 1.0f;
+
+    TransformState transform;
+    uint32_t color = MFB_RGB(255, 255, 255);
+};
+
+struct Camera {
+    glm::vec3 position{0.0f, 0.0f, 7.0f};
+    glm::vec3 rotation{0.0f};
+
+    glm::vec3 target{0.0f, 0.0f, 0.0f};
+
+    float field_of_view = 60.0f;
+    float near_plane = 0.1f;
+    float far_plane = 100.0f;
+
+    bool use_look_at = false;
+    bool use_perspective = true;
+
+    bool dolly_zoom_enabled = false;
+    float dolly_zoom_value = 0.0f;
+};
+
+// ============================================================
+// Framebuffer helpers
+// ============================================================
+
+void put_pixel(int x, int y, uint32_t color) {
+    if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+        g_buffer[y * WIDTH + x] = color;
+    }
+}
+
+void draw_line_bresenham(
+    int x0,
+    int y0,
+    int x1,
+    int y1,
+    uint32_t color) {
+
+    int dx = std::abs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+
+    int dy = -std::abs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+
+    int error = dx + dy;
+
+    while (true) {
+        put_pixel(x0, y0, color);
+
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+
+        int doubled_error = 2 * error;
+
+        if (doubled_error >= dy) {
+            error += dy;
+            x0 += sx;
+        }
+
+        if (doubled_error <= dx) {
+            error += dx;
+            y0 += sy;
+        }
+    }
+}
+
+void clear_background() {
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            float horizontal =
+                static_cast<float>(x) /
+                static_cast<float>(WIDTH);
+
+            float vertical =
+                static_cast<float>(y) /
+                static_cast<float>(HEIGHT);
+
+            uint8_t red =
+                static_cast<uint8_t>(
+                    10.0f + horizontal * 17.0f);
+
+            uint8_t green =
+                static_cast<uint8_t>(
+                    17.0f + vertical * 24.0f);
+
+            uint8_t blue =
+                static_cast<uint8_t>(
+                    31.0f +
+                    horizontal * 34.0f +
+                    vertical * 15.0f);
+
+            g_buffer[y * WIDTH + x] =
+                MFB_RGB(red, green, blue);
+        }
+    }
+
+    for (int y = 0; y < HEIGHT; y++) {
+        put_pixel(
+            UI_WIDTH,
+            y,
+            MFB_RGB(100, 110, 135));
+
+        put_pixel(
+            UI_WIDTH + 1,
+            y,
+            MFB_RGB(100, 110, 135));
+    }
+}
+
+// ============================================================
+// Default OBJ files
+// ============================================================
+
+void create_default_obj_files() {
+    std::filesystem::create_directories("models");
+
+    if (!std::filesystem::exists("models/cube.obj")) {
+        std::ofstream file("models/cube.obj");
+
+        file <<
+            "# Cube\n"
+            "v -1 -1 -1\n"
+            "v  1 -1 -1\n"
+            "v  1  1 -1\n"
+            "v -1  1 -1\n"
+            "v -1 -1  1\n"
+            "v  1 -1  1\n"
+            "v  1  1  1\n"
+            "v -1  1  1\n"
+            "f 1 2 3\n"
+            "f 1 3 4\n"
+            "f 5 7 6\n"
+            "f 5 8 7\n"
+            "f 1 5 6\n"
+            "f 1 6 2\n"
+            "f 4 3 7\n"
+            "f 4 7 8\n"
+            "f 1 4 8\n"
+            "f 1 8 5\n"
+            "f 2 6 7\n"
+            "f 2 7 3\n";
+    }
+
+    if (!std::filesystem::exists("models/pyramid.obj")) {
+        std::ofstream file("models/pyramid.obj");
+
+        file <<
+            "# Pyramid\n"
+            "v -1 -1 -1\n"
+            "v  1 -1 -1\n"
+            "v  1 -1  1\n"
+            "v -1 -1  1\n"
+            "v  0  1  0\n"
+            "f 1 2 3\n"
+            "f 1 3 4\n"
+            "f 1 5 2\n"
+            "f 2 5 3\n"
+            "f 3 5 4\n"
+            "f 4 5 1\n";
+    }
+
+    if (!std::filesystem::exists(
+            "models/octahedron.obj")) {
+
+        std::ofstream file(
+            "models/octahedron.obj");
+
+        file <<
+            "# Octahedron\n"
+            "v  1  0  0\n"
+            "v -1  0  0\n"
+            "v  0  1  0\n"
+            "v  0 -1  0\n"
+            "v  0  0  1\n"
+            "v  0  0 -1\n"
+            "f 1 3 5\n"
+            "f 3 2 5\n"
+            "f 2 4 5\n"
+            "f 4 1 5\n"
+            "f 3 1 6\n"
+            "f 2 3 6\n"
+            "f 4 2 6\n"
+            "f 1 4 6\n";
+    }
+}
+
+// ============================================================
+// OBJ loading and geometry calculations
+// ============================================================
+
+int parse_obj_index(
+    const std::string &token,
+    int vertex_count) {
+
+    std::string index_text = token;
+
+    std::size_t slash =
+        index_text.find('/');
+
+    if (slash != std::string::npos) {
+        index_text =
+            index_text.substr(0, slash);
+    }
+
+    if (index_text.empty()) {
+        return -1;
+    }
+
+    int index = std::stoi(index_text);
+
+    if (index > 0) {
+        return index - 1;
+    }
+
+    if (index < 0) {
+        return vertex_count + index;
+    }
+
+    return -1;
+}
+
+void calculate_bounding_box(Mesh &mesh) {
+    if (mesh.vertices.empty()) {
+        mesh.minimum = glm::vec3(0.0f);
+        mesh.maximum = glm::vec3(0.0f);
+        mesh.center = glm::vec3(0.0f);
+        mesh.normalization_scale = 1.0f;
+        return;
+    }
+
+    mesh.minimum = mesh.vertices.front();
+    mesh.maximum = mesh.vertices.front();
+
+    for (const glm::vec3 &vertex : mesh.vertices) {
+        mesh.minimum =
+            glm::min(mesh.minimum, vertex);
+
+        mesh.maximum =
+            glm::max(mesh.maximum, vertex);
+    }
+
+    mesh.center =
+        (mesh.minimum + mesh.maximum) * 0.5f;
+
+    glm::vec3 dimensions =
+        mesh.maximum - mesh.minimum;
+
+    float largest_dimension =
+        std::max({
+            dimensions.x,
+            dimensions.y,
+            dimensions.z
+        });
+
+    if (largest_dimension < 0.0001f) {
+        largest_dimension = 1.0f;
+    }
+
+    mesh.normalization_scale =
+        2.0f / largest_dimension;
+}
+
+void calculate_normals(Mesh &mesh) {
+    mesh.face_normals.clear();
+
+    mesh.vertex_normals.assign(
+        mesh.vertices.size(),
+        glm::vec3(0.0f));
+
+    for (const Face &face : mesh.faces) {
+        const glm::vec3 &a =
+            mesh.vertices[face.a];
+
+        const glm::vec3 &b =
+            mesh.vertices[face.b];
+
+        const glm::vec3 &c =
+            mesh.vertices[face.c];
+
+        glm::vec3 edge_ab = b - a;
+        glm::vec3 edge_ac = c - a;
+
+        glm::vec3 normal =
+            glm::cross(edge_ab, edge_ac);
+
+        float length =
+            glm::length(normal);
+
+        if (length > 0.0001f) {
+            normal /= length;
+        } else {
+            normal = glm::vec3(0.0f);
+        }
+
+        mesh.face_normals.push_back(normal);
+
+        mesh.vertex_normals[face.a] += normal;
+        mesh.vertex_normals[face.b] += normal;
+        mesh.vertex_normals[face.c] += normal;
+    }
+
+    for (glm::vec3 &normal :
+         mesh.vertex_normals) {
+
+        float length =
+            glm::length(normal);
+
+        if (length > 0.0001f) {
+            normal /= length;
+        }
+    }
+}
+
+bool load_obj(
+    const std::string &filename,
+    Mesh &mesh) {
+
+    std::ifstream file(filename);
+
+    if (!file.is_open()) {
+        std::printf(
+            "Could not open OBJ file: %s\n",
+            filename.c_str());
+
+        return false;
+    }
+
+    mesh.filename = filename;
+    mesh.vertices.clear();
+    mesh.faces.clear();
+
+    std::string line;
+
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+
+        std::istringstream stream(line);
+        std::string type;
+
+        stream >> type;
+
+        if (type == "v") {
+            glm::vec3 vertex;
+
+            stream >>
+                vertex.x >>
+                vertex.y >>
+                vertex.z;
+
+            if (!stream.fail()) {
+                mesh.vertices.push_back(vertex);
+            }
+        }
+
+        if (type == "f") {
+            std::vector<int> polygon;
+            std::string token;
+
+            while (stream >> token) {
+                int index =
+                    parse_obj_index(
+                        token,
+                        static_cast<int>(
+                            mesh.vertices.size()));
+
+                if (index >= 0 &&
+                    index <
+                    static_cast<int>(
+                        mesh.vertices.size())) {
+
+                    polygon.push_back(index);
+                }
+            }
+
+            for (std::size_t i = 1;
+                 i + 1 < polygon.size();
+                 i++) {
+
+                mesh.faces.push_back({
+                    polygon[0],
+                    polygon[i],
+                    polygon[i + 1]
+                });
+            }
+        }
+    }
+
+    calculate_bounding_box(mesh);
+    calculate_normals(mesh);
+
+    std::printf(
+        "Loaded %s: %zu vertices, %zu faces\n",
+        filename.c_str(),
+        mesh.vertices.size(),
+        mesh.faces.size());
+
+    return !mesh.vertices.empty() &&
+           !mesh.faces.empty();
+}
+
+// ============================================================
+// Transformation matrices
+// ============================================================
+
+glm::mat4 create_rotation_matrix(
+    const glm::vec3 &rotation_degrees) {
+
+    glm::mat4 matrix(1.0f);
+
+    matrix = glm::rotate(
+        matrix,
+        glm::radians(rotation_degrees.x),
+        glm::vec3(1.0f, 0.0f, 0.0f));
+
+    matrix = glm::rotate(
+        matrix,
+        glm::radians(rotation_degrees.y),
+        glm::vec3(0.0f, 1.0f, 0.0f));
+
+    matrix = glm::rotate(
+        matrix,
+        glm::radians(rotation_degrees.z),
+        glm::vec3(0.0f, 0.0f, 1.0f));
+
+    return matrix;
+}
+
+glm::mat4 create_local_world_matrix(
+    const Mesh &mesh) {
+
+    glm::mat4 local_translation =
+        glm::translate(
+            glm::mat4(1.0f),
+            mesh.transform.local_translation);
+
+    glm::mat4 local_rotation =
+        create_rotation_matrix(
+            mesh.transform.local_rotation);
+
+    glm::mat4 local_scale =
+        glm::scale(
+            glm::mat4(1.0f),
+            mesh.transform.local_scale);
+
+    glm::mat4 world_translation =
+        glm::translate(
+            glm::mat4(1.0f),
+            mesh.transform.world_translation);
+
+    glm::mat4 world_rotation =
+        create_rotation_matrix(
+            mesh.transform.world_rotation);
+
+    glm::mat4 world_scale =
+        glm::scale(
+            glm::mat4(1.0f),
+            mesh.transform.world_scale);
+
+    glm::mat4 local_matrix =
+        local_translation *
+        local_rotation *
+        local_scale;
+
+    glm::mat4 world_matrix =
+        world_translation *
+        world_rotation *
+        world_scale;
+
+    return world_matrix * local_matrix;
+}
+
+glm::mat4 create_model_matrix(
+    const Mesh &mesh) {
+
+    glm::mat4 normalization(1.0f);
+
+    normalization =
+        glm::scale(
+            normalization,
+            glm::vec3(
+                mesh.normalization_scale));
+
+    normalization =
+        glm::translate(
+            normalization,
+            -mesh.center);
+
+    return create_local_world_matrix(mesh) *
+           normalization;
+}
+         
