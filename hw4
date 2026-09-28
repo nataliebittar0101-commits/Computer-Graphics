@@ -317,3 +317,370 @@ void create_default_models() {
             "f 1 4 6\n";
     }
 }
+// ============================================================
+// OBJ loading
+// ============================================================
+
+int parse_obj_index(
+    const std::string &token,
+    int vertex_count) {
+
+    std::string text = token;
+
+    std::size_t slash =
+        text.find('/');
+
+    if (slash != std::string::npos) {
+        text =
+            text.substr(0, slash);
+    }
+
+    if (text.empty()) {
+        return -1;
+    }
+
+    int index =
+        std::stoi(text);
+
+    if (index > 0) {
+        return index - 1;
+    }
+
+    if (index < 0) {
+        return vertex_count + index;
+    }
+
+    return -1;
+}
+
+void calculate_mesh_bounds(
+    Mesh &mesh) {
+
+    if (mesh.vertices.empty()) {
+        return;
+    }
+
+    mesh.minimum =
+        mesh.vertices.front();
+
+    mesh.maximum =
+        mesh.vertices.front();
+
+    for (const glm::vec3 &vertex :
+         mesh.vertices) {
+
+        mesh.minimum =
+            glm::min(
+                mesh.minimum,
+                vertex);
+
+        mesh.maximum =
+            glm::max(
+                mesh.maximum,
+                vertex);
+    }
+
+    mesh.center =
+        (mesh.minimum +
+         mesh.maximum) *
+        0.5f;
+
+    glm::vec3 dimensions =
+        mesh.maximum -
+        mesh.minimum;
+
+    float largest =
+        std::max({
+            dimensions.x,
+            dimensions.y,
+            dimensions.z
+        });
+
+    if (largest < EPSILON) {
+        largest = 1.0f;
+    }
+
+    mesh.normalization_scale =
+        2.0f / largest;
+}
+
+bool load_obj(
+    const std::string &filename,
+    Mesh &mesh) {
+
+    std::ifstream file(filename);
+
+    if (!file.is_open()) {
+        std::printf(
+            "Could not open %s\n",
+            filename.c_str());
+
+        return false;
+    }
+
+    mesh.vertices.clear();
+    mesh.faces.clear();
+
+    std::string line;
+
+    while (std::getline(file, line)) {
+        if (line.empty() ||
+            line[0] == '#') {
+
+            continue;
+        }
+
+        std::istringstream stream(line);
+
+        std::string type;
+        stream >> type;
+
+        if (type == "v") {
+            glm::vec3 vertex;
+
+            stream >>
+                vertex.x >>
+                vertex.y >>
+                vertex.z;
+
+            if (!stream.fail()) {
+                mesh.vertices.push_back(
+                    vertex);
+            }
+        }
+
+        if (type == "f") {
+            std::vector<int> polygon;
+            std::string token;
+
+            while (stream >> token) {
+                int index =
+                    parse_obj_index(
+                        token,
+                        static_cast<int>(
+                            mesh.vertices.size()));
+
+                if (index >= 0 &&
+                    index <
+                    static_cast<int>(
+                        mesh.vertices.size())) {
+
+                    polygon.push_back(index);
+                }
+            }
+
+            for (std::size_t i = 1;
+                 i + 1 < polygon.size();
+                 i++) {
+
+                mesh.faces.push_back({
+                    polygon[0],
+                    polygon[i],
+                    polygon[i + 1]
+                });
+            }
+        }
+    }
+
+    calculate_mesh_bounds(mesh);
+
+    std::printf(
+        "Loaded %s: %zu vertices, %zu triangles\n",
+        filename.c_str(),
+        mesh.vertices.size(),
+        mesh.faces.size());
+
+    return
+        !mesh.vertices.empty() &&
+        !mesh.faces.empty();
+}
+
+// ============================================================
+// Matrices
+// ============================================================
+
+glm::mat4 rotation_matrix(
+    const glm::vec3 &rotation) {
+
+    glm::mat4 matrix(1.0f);
+
+    matrix =
+        glm::rotate(
+            matrix,
+            glm::radians(rotation.x),
+            glm::vec3(
+                1.0f,
+                0.0f,
+                0.0f));
+
+    matrix =
+        glm::rotate(
+            matrix,
+            glm::radians(rotation.y),
+            glm::vec3(
+                0.0f,
+                1.0f,
+                0.0f));
+
+    matrix =
+        glm::rotate(
+            matrix,
+            glm::radians(rotation.z),
+            glm::vec3(
+                0.0f,
+                0.0f,
+                1.0f));
+
+    return matrix;
+}
+
+glm::mat4 model_matrix(
+    const Mesh &mesh) {
+
+    glm::mat4 normalization(1.0f);
+
+    normalization =
+        glm::scale(
+            normalization,
+            glm::vec3(
+                mesh.normalization_scale));
+
+    normalization =
+        glm::translate(
+            normalization,
+            -mesh.center);
+
+    glm::mat4 translation =
+        glm::translate(
+            glm::mat4(1.0f),
+            mesh.transform.translation);
+
+    glm::mat4 rotation =
+        rotation_matrix(
+            mesh.transform.rotation);
+
+    glm::mat4 scale =
+        glm::scale(
+            glm::mat4(1.0f),
+            mesh.transform.scale);
+
+    return
+        translation *
+        rotation *
+        scale *
+        normalization;
+}
+
+glm::mat4 view_matrix(
+    const Camera &camera) {
+
+    return glm::lookAt(
+        camera.position,
+        glm::vec3(0.0f),
+        glm::vec3(
+            0.0f,
+            1.0f,
+            0.0f));
+}
+
+glm::mat4 projection_matrix(
+    const Camera &camera) {
+
+    float viewport_width =
+        static_cast<float>(
+            WIDTH - UI_WIDTH);
+
+    float aspect =
+        viewport_width /
+        static_cast<float>(HEIGHT);
+
+    if (camera.perspective) {
+        return glm::perspective(
+            glm::radians(
+                camera.field_of_view),
+            aspect,
+            camera.near_plane,
+            camera.far_plane);
+    }
+
+    constexpr float height = 3.5f;
+
+    float width =
+        height * aspect;
+
+    return glm::ortho(
+        -width,
+        width,
+        -height,
+        height,
+        camera.near_plane,
+        camera.far_plane);
+}
+
+// ============================================================
+// Projection
+// ============================================================
+
+RasterVertex project_vertex(
+    const glm::vec3 &world_vertex,
+    const glm::mat4 &view,
+    const glm::mat4 &projection) {
+
+    RasterVertex result;
+
+    glm::vec4 view_position =
+        view *
+        glm::vec4(
+            world_vertex,
+            1.0f);
+
+    glm::vec4 clip =
+        projection *
+        view_position;
+
+    if (std::abs(clip.w) <
+        EPSILON) {
+
+        return result;
+    }
+
+    if (clip.w <= 0.0f) {
+        return result;
+    }
+
+    glm::vec3 ndc =
+        glm::vec3(clip) /
+        clip.w;
+
+    if (ndc.z < -1.0f ||
+        ndc.z > 1.0f) {
+
+        return result;
+    }
+
+    int viewport_width =
+        WIDTH - UI_WIDTH;
+
+    result.x =
+        static_cast<float>(
+            UI_WIDTH) +
+        (ndc.x * 0.5f + 0.5f) *
+        static_cast<float>(
+            viewport_width);
+
+    result.y =
+        (1.0f -
+         (ndc.y * 0.5f + 0.5f)) *
+        static_cast<float>(HEIGHT);
+
+    result.z =
+        ndc.z * 0.5f +
+        0.5f;
+
+    result.view_position =
+        glm::vec3(view_position);
+
+    result.valid = true;
+
+    return result;
+}
