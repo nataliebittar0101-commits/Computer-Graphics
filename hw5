@@ -34,3 +34,735 @@ constexpr float PI_VALUE = 3.14159265358979323846f;
 
 static uint32_t g_buffer[WIDTH * HEIGHT];
 static float g_z_buffer[WIDTH * HEIGHT];
+// ============================================================
+// Data structures
+// ============================================================
+
+struct Face {
+    int a = 0;
+    int b = 0;
+    int c = 0;
+
+    int ta = -1;
+    int tb = -1;
+    int tc = -1;
+};
+
+struct TransformState {
+    glm::vec3 translation{0.0f};
+    glm::vec3 rotation{0.0f};
+    glm::vec3 scale{1.0f};
+};
+
+struct Material {
+    glm::vec3 ambient{0.25f, 0.10f, 0.10f};
+    glm::vec3 diffuse{0.85f, 0.30f, 0.25f};
+    glm::vec3 specular{1.0f, 1.0f, 1.0f};
+
+    float shininess = 32.0f;
+};
+
+struct PointLight {
+    glm::vec3 position{2.5f, 3.5f, 4.0f};
+
+    glm::vec3 ambient{0.30f, 0.30f, 0.30f};
+    glm::vec3 diffuse{1.0f, 1.0f, 1.0f};
+    glm::vec3 specular{1.0f, 1.0f, 1.0f};
+};
+
+struct Mesh {
+    std::string name;
+    std::string filename;
+
+    std::vector<glm::vec3> vertices;
+    std::vector<glm::vec2> texture_coordinates;
+    std::vector<Face> faces;
+
+    std::vector<glm::vec3> face_normals;
+    std::vector<glm::vec3> vertex_normals;
+
+    glm::vec3 minimum{0.0f};
+    glm::vec3 maximum{0.0f};
+    glm::vec3 center{0.0f};
+
+    float normalization_scale = 1.0f;
+
+    TransformState transform;
+    Material material;
+};
+
+struct Camera {
+    glm::vec3 position{0.0f, 0.0f, 7.0f};
+
+    float field_of_view = 60.0f;
+    float near_plane = 0.1f;
+    float far_plane = 100.0f;
+
+    bool perspective = true;
+};
+
+enum class ShadingMode {
+    Flat = 0,
+    Gouraud = 1,
+    Phong = 2
+};
+
+struct RasterVertex {
+    float x = 0.0f;
+    float y = 0.0f;
+    float depth = 0.0f;
+
+    glm::vec3 world_position{0.0f};
+    glm::vec3 world_normal{0.0f};
+    glm::vec2 uv{0.0f};
+
+    glm::vec3 gouraud_color{1.0f};
+
+    bool valid = false;
+};
+
+struct Texture {
+    int width = 0;
+    int height = 0;
+
+    std::vector<uint32_t> pixels;
+
+    bool valid() const {
+        return width > 0 &&
+               height > 0 &&
+               !pixels.empty();
+    }
+};
+
+// ============================================================
+// Utility functions
+// ============================================================
+
+glm::vec3 clamp_color(
+    const glm::vec3 &color) {
+
+    return glm::clamp(
+        color,
+        glm::vec3(0.0f),
+        glm::vec3(1.0f));
+}
+
+uint32_t color_to_pixel(
+    const glm::vec3 &color) {
+
+    glm::vec3 result =
+        clamp_color(color);
+
+    uint8_t red =
+        static_cast<uint8_t>(
+            result.r * 255.0f);
+
+    uint8_t green =
+        static_cast<uint8_t>(
+            result.g * 255.0f);
+
+    uint8_t blue =
+        static_cast<uint8_t>(
+            result.b * 255.0f);
+
+    return MFB_RGB(
+        red,
+        green,
+        blue);
+}
+
+void put_pixel(
+    int x,
+    int y,
+    uint32_t color) {
+
+    if (x < UI_WIDTH + 2 ||
+        x >= WIDTH ||
+        y < 0 ||
+        y >= HEIGHT) {
+
+        return;
+    }
+
+    g_buffer[y * WIDTH + x] =
+        color;
+}
+
+void clear_background() {
+    for (int y = 0;
+         y < HEIGHT;
+         y++) {
+
+        for (int x = 0;
+             x < WIDTH;
+             x++) {
+
+            float horizontal =
+                static_cast<float>(x) /
+                static_cast<float>(WIDTH);
+
+            float vertical =
+                static_cast<float>(y) /
+                static_cast<float>(HEIGHT);
+
+            uint8_t red =
+                static_cast<uint8_t>(
+                    8.0f +
+                    horizontal * 15.0f);
+
+            uint8_t green =
+                static_cast<uint8_t>(
+                    13.0f +
+                    vertical * 20.0f);
+
+            uint8_t blue =
+                static_cast<uint8_t>(
+                    32.0f +
+                    horizontal * 25.0f +
+                    vertical * 12.0f);
+
+            g_buffer[y * WIDTH + x] =
+                MFB_RGB(
+                    red,
+                    green,
+                    blue);
+        }
+    }
+
+    for (int y = 0;
+         y < HEIGHT;
+         y++) {
+
+        g_buffer[
+            y * WIDTH + UI_WIDTH] =
+            MFB_RGB(
+                110,
+                115,
+                135);
+
+        g_buffer[
+            y * WIDTH +
+            UI_WIDTH + 1] =
+            MFB_RGB(
+                110,
+                115,
+                135);
+    }
+}
+
+void clear_z_buffer() {
+    float infinity =
+        std::numeric_limits<float>
+            ::infinity();
+
+    for (float &value :
+         g_z_buffer) {
+
+        value = infinity;
+    }
+}
+
+void draw_line(
+    int x0,
+    int y0,
+    int x1,
+    int y1,
+    uint32_t color) {
+
+    int dx =
+        std::abs(x1 - x0);
+
+    int sx =
+        x0 < x1 ? 1 : -1;
+
+    int dy =
+        -std::abs(y1 - y0);
+
+    int sy =
+        y0 < y1 ? 1 : -1;
+
+    int error =
+        dx + dy;
+
+    while (true) {
+        put_pixel(
+            x0,
+            y0,
+            color);
+
+        if (x0 == x1 &&
+            y0 == y1) {
+
+            break;
+        }
+
+        int doubled_error =
+            2 * error;
+
+        if (doubled_error >= dy) {
+            error += dy;
+            x0 += sx;
+        }
+
+        if (doubled_error <= dx) {
+            error += dx;
+            y0 += sy;
+        }
+    }
+}
+
+// ============================================================
+// Default OBJ files
+// ============================================================
+
+void create_default_models() {
+    std::filesystem::create_directories(
+        "models");
+
+    if (!std::filesystem::exists(
+            "models/cube.obj")) {
+
+        std::ofstream file(
+            "models/cube.obj");
+
+        file <<
+            "v -1 -1 -1\n"
+            "v  1 -1 -1\n"
+            "v  1  1 -1\n"
+            "v -1  1 -1\n"
+            "v -1 -1  1\n"
+            "v  1 -1  1\n"
+            "v  1  1  1\n"
+            "v -1  1  1\n"
+
+            "vt 0 0\n"
+            "vt 1 0\n"
+            "vt 1 1\n"
+            "vt 0 1\n"
+
+            "f 1/1 2/2 3/3\n"
+            "f 1/1 3/3 4/4\n"
+
+            "f 5/1 7/3 6/2\n"
+            "f 5/1 8/4 7/3\n"
+
+            "f 1/1 5/2 6/3\n"
+            "f 1/1 6/3 2/4\n"
+
+            "f 4/1 3/2 7/3\n"
+            "f 4/1 7/3 8/4\n"
+
+            "f 1/1 4/2 8/3\n"
+            "f 1/1 8/3 5/4\n"
+
+            "f 2/1 6/2 7/3\n"
+            "f 2/1 7/3 3/4\n";
+    }
+
+    if (!std::filesystem::exists(
+            "models/pyramid.obj")) {
+
+        std::ofstream file(
+            "models/pyramid.obj");
+
+        file <<
+            "v -1 -1 -1\n"
+            "v  1 -1 -1\n"
+            "v  1 -1  1\n"
+            "v -1 -1  1\n"
+            "v  0  1  0\n"
+
+            "vt 0 0\n"
+            "vt 1 0\n"
+            "vt 1 1\n"
+            "vt 0 1\n"
+            "vt 0.5 1\n"
+
+            "f 1/1 2/2 3/3\n"
+            "f 1/1 3/3 4/4\n"
+
+            "f 1/1 5/5 2/2\n"
+            "f 2/1 5/5 3/2\n"
+            "f 3/1 5/5 4/2\n"
+            "f 4/1 5/5 1/2\n";
+    }
+
+    if (!std::filesystem::exists(
+            "models/octahedron.obj")) {
+
+        std::ofstream file(
+            "models/octahedron.obj");
+
+        file <<
+            "v  1  0  0\n"
+            "v -1  0  0\n"
+            "v  0  1  0\n"
+            "v  0 -1  0\n"
+            "v  0  0  1\n"
+            "v  0  0 -1\n"
+
+            "vt 0 0\n"
+            "vt 1 0\n"
+            "vt 0.5 1\n"
+
+            "f 1/1 3/3 5/2\n"
+            "f 3/1 2/3 5/2\n"
+            "f 2/1 4/3 5/2\n"
+            "f 4/1 1/3 5/2\n"
+
+            "f 3/1 1/3 6/2\n"
+            "f 2/1 3/3 6/2\n"
+            "f 4/1 2/3 6/2\n"
+            "f 1/1 4/3 6/2\n";
+    }
+}
+
+// ============================================================
+// OBJ loading
+// ============================================================
+
+int parse_obj_index(
+    const std::string &text,
+    int count) {
+
+    if (text.empty()) {
+        return -1;
+    }
+
+    int index =
+        std::stoi(text);
+
+    if (index > 0) {
+        return index - 1;
+    }
+
+    if (index < 0) {
+        return count + index;
+    }
+
+    return -1;
+}
+
+void parse_face_token(
+    const std::string &token,
+    int vertex_count,
+    int texture_count,
+    int &vertex_index,
+    int &texture_index) {
+
+    vertex_index = -1;
+    texture_index = -1;
+
+    std::size_t first_slash =
+        token.find('/');
+
+    if (first_slash ==
+        std::string::npos) {
+
+        vertex_index =
+            parse_obj_index(
+                token,
+                vertex_count);
+
+        return;
+    }
+
+    std::string vertex_text =
+        token.substr(
+            0,
+            first_slash);
+
+    vertex_index =
+        parse_obj_index(
+            vertex_text,
+            vertex_count);
+
+    std::size_t second_slash =
+        token.find(
+            '/',
+            first_slash + 1);
+
+    std::string texture_text;
+
+    if (second_slash ==
+        std::string::npos) {
+
+        texture_text =
+            token.substr(
+                first_slash + 1);
+    } else {
+        texture_text =
+            token.substr(
+                first_slash + 1,
+                second_slash -
+                first_slash - 1);
+    }
+
+    if (!texture_text.empty()) {
+        texture_index =
+            parse_obj_index(
+                texture_text,
+                texture_count);
+    }
+}
+
+void calculate_mesh_bounds(
+    Mesh &mesh) {
+
+    if (mesh.vertices.empty()) {
+        return;
+    }
+
+    mesh.minimum =
+        mesh.vertices.front();
+
+    mesh.maximum =
+        mesh.vertices.front();
+
+    for (const glm::vec3 &vertex :
+         mesh.vertices) {
+
+        mesh.minimum =
+            glm::min(
+                mesh.minimum,
+                vertex);
+
+        mesh.maximum =
+            glm::max(
+                mesh.maximum,
+                vertex);
+    }
+
+    mesh.center =
+        (
+            mesh.minimum +
+            mesh.maximum
+        ) * 0.5f;
+
+    glm::vec3 dimensions =
+        mesh.maximum -
+        mesh.minimum;
+
+    float largest_dimension =
+        std::max({
+            dimensions.x,
+            dimensions.y,
+            dimensions.z
+        });
+
+    if (largest_dimension <
+        EPSILON) {
+
+        largest_dimension =
+            1.0f;
+    }
+
+    mesh.normalization_scale =
+        2.0f /
+        largest_dimension;
+}
+
+void calculate_normals(
+    Mesh &mesh) {
+
+    mesh.face_normals.clear();
+
+    mesh.vertex_normals.assign(
+        mesh.vertices.size(),
+        glm::vec3(0.0f));
+
+    for (const Face &face :
+         mesh.faces) {
+
+        const glm::vec3 &a =
+            mesh.vertices[face.a];
+
+        const glm::vec3 &b =
+            mesh.vertices[face.b];
+
+        const glm::vec3 &c =
+            mesh.vertices[face.c];
+
+        glm::vec3 normal =
+            glm::cross(
+                b - a,
+                c - a);
+
+        if (glm::length(normal) >
+            EPSILON) {
+
+            normal =
+                glm::normalize(normal);
+        }
+
+        mesh.face_normals.push_back(
+            normal);
+
+        mesh.vertex_normals[face.a] +=
+            normal;
+
+        mesh.vertex_normals[face.b] +=
+            normal;
+
+        mesh.vertex_normals[face.c] +=
+            normal;
+    }
+
+    for (glm::vec3 &normal :
+         mesh.vertex_normals) {
+
+        if (glm::length(normal) >
+            EPSILON) {
+
+            normal =
+                glm::normalize(normal);
+        }
+    }
+}
+
+bool load_obj(
+    const std::string &filename,
+    Mesh &mesh) {
+
+    std::ifstream file(filename);
+
+    if (!file.is_open()) {
+        std::printf(
+            "Could not open %s\n",
+            filename.c_str());
+
+        return false;
+    }
+
+    mesh.filename =
+        filename;
+
+    mesh.vertices.clear();
+    mesh.texture_coordinates.clear();
+    mesh.faces.clear();
+
+    std::string line;
+
+    while (std::getline(
+        file,
+        line)) {
+
+        if (line.empty() ||
+            line[0] == '#') {
+
+            continue;
+        }
+
+        std::istringstream stream(
+            line);
+
+        std::string type;
+
+        stream >> type;
+
+        if (type == "v") {
+            glm::vec3 vertex;
+
+            stream >>
+                vertex.x >>
+                vertex.y >>
+                vertex.z;
+
+            if (!stream.fail()) {
+                mesh.vertices.push_back(
+                    vertex);
+            }
+        } else if (type == "vt") {
+            glm::vec2 texture_coordinate;
+
+            stream >>
+                texture_coordinate.x >>
+                texture_coordinate.y;
+
+            if (!stream.fail()) {
+                mesh.texture_coordinates
+                    .push_back(
+                        texture_coordinate);
+            }
+        } else if (type == "f") {
+            std::vector<int>
+                polygon_vertices;
+
+            std::vector<int>
+                polygon_textures;
+
+            std::string token;
+
+            while (stream >> token) {
+                int vertex_index;
+                int texture_index;
+
+                parse_face_token(
+                    token,
+                    static_cast<int>(
+                        mesh.vertices.size()),
+                    static_cast<int>(
+                        mesh.texture_coordinates
+                            .size()),
+                    vertex_index,
+                    texture_index);
+
+                if (vertex_index >= 0 &&
+                    vertex_index <
+                    static_cast<int>(
+                        mesh.vertices.size())) {
+
+                    polygon_vertices
+                        .push_back(
+                            vertex_index);
+
+                    polygon_textures
+                        .push_back(
+                            texture_index);
+                }
+            }
+
+            for (std::size_t i = 1;
+                 i + 1 <
+                 polygon_vertices.size();
+                 i++) {
+
+                Face face;
+
+                face.a =
+                    polygon_vertices[0];
+
+                face.b =
+                    polygon_vertices[i];
+
+                face.c =
+                    polygon_vertices[i + 1];
+
+                face.ta =
+                    polygon_textures[0];
+
+                face.tb =
+                    polygon_textures[i];
+
+                face.tc =
+                    polygon_textures[i + 1];
+
+                mesh.faces.push_back(
+                    face);
+            }
+        }
+    }
+
+    calculate_mesh_bounds(mesh);
+    calculate_normals(mesh);
+
+    std::printf(
+        "Loaded %s: %zu vertices, %zu triangles\n",
+        filename.c_str(),
+        mesh.vertices.size(),
+        mesh.faces.size());
+
+    return
+        !mesh.vertices.empty() &&
+        !mesh.faces.empty();
+}
