@@ -1,4 +1,4 @@
- #include "MiniFB.h"
+#include "MiniFB.h"
 
 #include <algorithm>
 #include <cmath>
@@ -28,11 +28,12 @@ extern "C" {
 constexpr int UI_WIDTH = 440;
 constexpr float SCREEN_MODEL_SCALE = 140.0f;
 
+static uint32_t g_buffer[WIDTH * HEIGHT];
+
 // ============================================================
 // Data structures
 // ============================================================
 
-static uint32_t g_buffer[WIDTH * HEIGHT];
 struct Face {
     int a = 0;
     int b = 0;
