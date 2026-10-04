@@ -2297,4 +2297,375 @@ void draw_shadow_map_debug(const ShadowMap &shadow_map) {
 // ============================================================
 // Mesh rendering
 // ============================================================
+void render_mesh(
+    const Mesh &mesh,
+    const Camera &camera,
+    const SceneLight &light,
+    const Texture &texture,
+    const glm::mat4 &view,
+    const glm::mat4 &projection,
+    ShadingMode shading_mode,
+    bool texture_enabled,
+    bool ambient_enabled,
+    bool diffuse_enabled,
+    bool specular_enabled,
+    bool backface_culling,
+    bool wireframe_overlay,
+    bool debug_vectors,
+    bool active_mesh,
+    bool shadows_enabled,
+    const ShadowMap &shadow_map) {
+
+    glm::mat4 model =
+        model_matrix(mesh);
+
+    glm::mat3 normal_matrix =
+        glm::transpose(
+            glm::inverse(
+                glm::mat3(model)));
+
+    std::vector<glm::vec3>
+        world_vertices;
+
+    std::vector<glm::vec3>
+        world_vertex_normals;
+
+    world_vertices.reserve(
+        mesh.vertices.size());
+
+    world_vertex_normals.reserve(
+        mesh.vertex_normals.size());
+
+    for (std::size_t i = 0;
+         i < mesh.vertices.size();
+         i++) {
+
+        world_vertices.push_back(
+            glm::vec3(
+                model *
+                glm::vec4(
+                    mesh.vertices[i],
+                    1.0f)));
+
+        glm::vec3 normal =
+            normal_matrix *
+            mesh.vertex_normals[i];
+
+        if (glm::length(normal) >
+            EPSILON) {
+
+            normal =
+                glm::normalize(normal);
+        }
+
+        world_vertex_normals.push_back(
+            normal);
+    }
+
+    for (std::size_t face_index = 0;
+         face_index <
+         mesh.faces.size();
+         face_index++) {
+
+        const Face &face =
+            mesh.faces[face_index];
+
+        glm::vec3 world_a =
+            world_vertices[face.a];
+
+        glm::vec3 world_b =
+            world_vertices[face.b];
+
+        glm::vec3 world_c =
+            world_vertices[face.c];
+
+        if (backface_culling &&
+            is_back_facing(
+                world_a,
+                world_b,
+                world_c,
+                camera)) {
+
+            continue;
+        }
+
+        glm::vec3 face_normal =
+            glm::cross(
+                world_b - world_a,
+                world_c - world_a);
+
+        if (glm::length(face_normal) >
+            EPSILON) {
+
+            face_normal =
+                glm::normalize(
+                    face_normal);
+        }
+
+        glm::vec3 face_center =
+            (
+                world_a +
+                world_b +
+                world_c
+            ) / 3.0f;
+
+        glm::vec2 uv_a(0.0f);
+        glm::vec2 uv_b(1.0f, 0.0f);
+        glm::vec2 uv_c(0.5f, 1.0f);
+
+        if (face.ta >= 0 &&
+            face.ta <
+            static_cast<int>(
+                mesh.texture_coordinates
+                    .size())) {
+
+            uv_a =
+                mesh.texture_coordinates[
+                    face.ta];
+        }
+
+        if (face.tb >= 0 &&
+            face.tb <
+            static_cast<int>(
+                mesh.texture_coordinates
+                    .size())) {
+
+            uv_b =
+                mesh.texture_coordinates[
+                    face.tb];
+        }
+
+        if (face.tc >= 0 &&
+            face.tc <
+            static_cast<int>(
+                mesh.texture_coordinates
+                    .size())) {
+
+            uv_c =
+                mesh.texture_coordinates[
+                    face.tc];
+        }
+
+        RasterVertex v0 =
+            project_vertex(
+                world_a,
+                world_vertex_normals[
+                    face.a],
+                uv_a,
+                view,
+                projection);
+
+        RasterVertex v1 =
+            project_vertex(
+                world_b,
+                world_vertex_normals[
+                    face.b],
+                uv_b,
+                view,
+                projection);
+
+        RasterVertex v2 =
+            project_vertex(
+                world_c,
+                world_vertex_normals[
+                    face.c],
+                uv_c,
+                view,
+                projection);
+
+        if (!v0.valid ||
+            !v1.valid ||
+            !v2.valid) {
+
+            continue;
+        }
+
+        glm::vec3 flat_texture_color =
+            texture_enabled
+                ? sample_texture(
+                      texture,
+                      (
+                          uv_a +
+                          uv_b +
+                          uv_c
+                      ) / 3.0f)
+                : glm::vec3(1.0f);
+
+        glm::vec3 flat_color =
+            calculate_lighting(
+                face_center,
+                face_normal,
+                camera,
+                light,
+                mesh.material,
+                ambient_enabled,
+                diffuse_enabled,
+                specular_enabled,
+                flat_texture_color,
+                shadows_enabled,
+                &shadow_map);
+
+        v0.gouraud_color =
+            calculate_lighting(
+                world_a,
+                world_vertex_normals[
+                    face.a],
+                camera,
+                light,
+                mesh.material,
+                ambient_enabled,
+                diffuse_enabled,
+                specular_enabled,
+                texture_enabled
+                    ? sample_texture(
+                          texture,
+                          uv_a)
+                    : glm::vec3(1.0f),
+                shadows_enabled,
+                &shadow_map);
+
+        v1.gouraud_color =
+            calculate_lighting(
+                world_b,
+                world_vertex_normals[
+                    face.b],
+                camera,
+                light,
+                mesh.material,
+                ambient_enabled,
+                diffuse_enabled,
+                specular_enabled,
+                texture_enabled
+                    ? sample_texture(
+                          texture,
+                          uv_b)
+                    : glm::vec3(1.0f),
+                shadows_enabled,
+                &shadow_map);
+
+        v2.gouraud_color =
+            calculate_lighting(
+                world_c,
+                world_vertex_normals[
+                    face.c],
+                camera,
+                light,
+                mesh.material,
+                ambient_enabled,
+                diffuse_enabled,
+                specular_enabled,
+                texture_enabled
+                    ? sample_texture(
+                          texture,
+                          uv_c)
+                    : glm::vec3(1.0f),
+                shadows_enabled,
+                &shadow_map);
+
+        rasterize_triangle(
+            v0,
+            v1,
+            v2,
+            flat_color,
+            shading_mode,
+            camera,
+            light,
+            mesh.material,
+            texture,
+            texture_enabled,
+            ambient_enabled,
+            diffuse_enabled,
+            specular_enabled,
+            shadows_enabled,
+            shadow_map);
+
+        if (wireframe_overlay) {
+            uint32_t line_color =
+                MFB_RGB(
+                    255,
+                    255,
+                    255);
+
+            draw_line(
+                static_cast<int>(
+                    v0.x),
+                static_cast<int>(
+                    v0.y),
+                static_cast<int>(
+                    v1.x),
+                static_cast<int>(
+                    v1.y),
+                line_color);
+
+            draw_line(
+                static_cast<int>(
+                    v1.x),
+                static_cast<int>(
+                    v1.y),
+                static_cast<int>(
+                    v2.x),
+                static_cast<int>(
+                    v2.y),
+                line_color);
+
+            draw_line(
+                static_cast<int>(
+                    v2.x),
+                static_cast<int>(
+                    v2.y),
+                static_cast<int>(
+                    v0.x),
+                static_cast<int>(
+                    v0.y),
+                line_color);
+        }
+
+        if (debug_vectors &&
+            active_mesh &&
+            face_index < 3) {
+
+            glm::vec3 light_direction =
+                light.position -
+                face_center;
+
+            if (glm::length(
+                    light_direction) >
+                EPSILON) {
+
+                light_direction =
+                    glm::normalize(
+                        light_direction);
+            }
+
+            glm::vec3 reflection_direction =
+                glm::reflect(
+                    -light_direction,
+                    face_normal);
+
+            draw_world_line(
+                face_center,
+                face_center +
+                    light_direction *
+                    0.65f,
+                view,
+                projection,
+                MFB_RGB(
+                    255,
+                    220,
+                    50));
+
+            draw_world_line(
+                face_center,
+                face_center +
+                    reflection_direction *
+                    0.65f,
+                view,
+                projection,
+                MFB_RGB(
+                    255,
+                    70,
+                    255));
+        }
+    }
+}
 
