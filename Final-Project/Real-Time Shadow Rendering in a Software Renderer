@@ -2668,4 +2668,1311 @@ void render_mesh(
         }
     }
 }
+// ============================================================
+// GUI helpers
+// ============================================================
+
+void gui_label(
+    mu_Context *ctx,
+    const char *text) {
+
+    int widths[] = {-1};
+
+    mu_layout_row(
+        ctx,
+        1,
+        widths,
+        0);
+
+    mu_label(
+        ctx,
+        text);
+}
+
+void gui_slider(
+    mu_Context *ctx,
+    const char *label,
+    float &value,
+    float minimum,
+    float maximum) {
+
+    int widths[] =
+        {150, -1};
+
+    mu_layout_row(
+        ctx,
+        2,
+        widths,
+        0);
+
+    mu_label(
+        ctx,
+        label);
+
+    mu_slider(
+        ctx,
+        &value,
+        minimum,
+        maximum);
+}
+
+void reset_transform(
+    TransformState &transform) {
+
+    transform.translation =
+        glm::vec3(0.0f);
+
+    transform.rotation =
+        glm::vec3(0.0f);
+
+    transform.scale =
+        glm::vec3(1.0f);
+}
+
+void reset_camera(
+    Camera &camera) {
+
+    camera.position =
+        glm::vec3(
+            0.0f,
+            2.2f,
+            7.5f);
+
+    camera.field_of_view =
+        60.0f;
+
+    camera.perspective =
+        true;
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+// ============================================================
+// Scene editor
+//
+// Runtime add, duplicate, remove, and layout operations.
+// ============================================================
+
+constexpr std::size_t MAX_SCENE_OBJECTS = 10;
+
+struct ModelPreset {
+    const char *display_name;
+    const char *obj_path;
+    glm::vec3 ambient;
+    glm::vec3 diffuse;
+    float shininess;
+};
+
+const std::array<ModelPreset, 3> MODEL_CATALOG = {
+    ModelPreset{
+        "Cube",
+        "models/cube.obj",
+        glm::vec3(0.25f, 0.08f, 0.08f),
+        glm::vec3(0.90f, 0.30f, 0.25f),
+        32.0f},
+    ModelPreset{
+        "Pyramid",
+        "models/pyramid.obj",
+        glm::vec3(0.08f, 0.20f, 0.08f),
+        glm::vec3(0.25f, 0.85f, 0.35f),
+        32.0f},
+    ModelPreset{
+        "Octahedron",
+        "models/octahedron.obj",
+        glm::vec3(0.08f, 0.12f, 0.25f),
+        glm::vec3(0.25f, 0.45f, 0.95f),
+        64.0f},
+};
+
+glm::vec3 scene_grid_position(
+    std::size_t index) {
+
+    constexpr int columns = 3;
+    constexpr float spacing = 1.6f;
+
+    int column =
+        static_cast<int>(index % columns);
+
+    int row =
+        static_cast<int>(index / columns);
+
+    float x =
+        (static_cast<float>(column) - 1.0f) *
+        spacing;
+
+    float z =
+        static_cast<float>(row) *
+        spacing;
+
+    return glm::vec3(x, 0.0f, z);
+}
+
+bool add_model_to_scene(
+    std::vector<Mesh> &meshes,
+    const ModelPreset &preset,
+    int &added_count) {
+
+    if (meshes.size() >=
+        MAX_SCENE_OBJECTS) {
+
+        return false;
+    }
+
+    Mesh mesh;
+
+    mesh.material.ambient =
+        preset.ambient;
+
+    mesh.material.diffuse =
+        preset.diffuse;
+
+    mesh.material.shininess =
+        preset.shininess;
+
+    if (!load_obj(
+            preset.obj_path,
+            mesh)) {
+
+        return false;
+    }
+
+    added_count++;
+
+    char name_buffer[64];
+
+    std::snprintf(
+        name_buffer,
+        sizeof(name_buffer),
+        "%s %d",
+        preset.display_name,
+        added_count);
+
+    mesh.name = name_buffer;
+
+    mesh.transform.translation =
+        scene_grid_position(
+            meshes.size());
+
+    // Give new objects a small default rotation.
+    mesh.transform.rotation =
+        glm::vec3(
+            18.0f,
+            25.0f +
+                15.0f *
+                    static_cast<float>(
+                        meshes.size() % 3),
+            0.0f);
+
+    place_mesh_on_ground(mesh);
+
+    meshes.push_back(mesh);
+
+    return true;
+}
+
+int main() {
+    create_default_models();
+
+    Texture texture =
+        load_bmp_texture("models/checker.bmp");
+
+    if (!texture.valid()) {
+        texture = create_checker_texture();
+    }
+
+    Mesh ground;
+
+    create_ground_plane(
+        ground,
+        6.0f,
+        GROUND_Y);
+
+    std::vector<Mesh> meshes;
+
+    int models_added_count = 0;
+
+    for (const ModelPreset &preset :
+         MODEL_CATALOG) {
+
+        add_model_to_scene(
+            meshes,
+            preset,
+            models_added_count);
+    }
+
+    if (meshes.empty()) {
+        std::printf(
+            "No models loaded\n");
+
+        return 1;
+    }
+
+    Camera camera;
+    SceneLight light;
+
+    int active_model = 0;
+
+    ShadingMode shading_mode =
+        ShadingMode::Phong;
+
+    int ambient_enabled = 1;
+    int diffuse_enabled = 1;
+    int specular_enabled = 1;
+
+    int backface_culling = 1;
+    int wireframe_overlay = 0;
+    int debug_vectors = 0;
+    int texture_enabled = 0;
+    int shadows_enabled = 1;
+    int show_shadow_map = 0;
+
+    // 0 = hard shadows, 1 = PCF 3x3, 2 = PCF 5x5.
+    int shadow_quality = 1;
+
+    ShadowMap shadow_map;
+
+    double frame_time_ms = 0.0;
+    double shadow_time_ms = 0.0;
+    double fps = 0.0;
+
+    struct mfb_window *window =
+        mfb_open_ex(
+            "Final Project - Interactive Scene Editor with Shadows",
+            WIDTH,
+            HEIGHT,
+            MFB_WF_RESIZABLE);
+
+    if (!window) {
+        return 1;
+    }
+
+    mfb_set_viewport_best_fit(
+        window,
+        WIDTH,
+        HEIGHT);
+
+    mfb_set_resize_callback(
+        [](struct mfb_window *window_pointer,
+           int width,
+           int height) {
+            (void)width;
+            (void)height;
+
+            mfb_set_viewport_best_fit(
+                window_pointer,
+                WIDTH,
+                HEIGHT);
+        },
+        window);
+
+    mu_Context *ctx =
+        static_cast<mu_Context *>(
+            std::malloc(
+                sizeof(mu_Context)));
+
+    if (!ctx) {
+        mfb_close(window);
+        return 1;
+    }
+
+    mu_init(ctx);
+
+    ctx->text_width =
+        [](mu_Font font,
+           const char *text,
+           int length) {
+
+            (void)font;
+
+            return
+                (
+                    length < 0
+                        ? static_cast<int>(
+                              std::strlen(text))
+                        : length
+                ) * 8;
+        };
+
+    ctx->text_height =
+        [](mu_Font font) {
+
+            (void)font;
+
+            return 8;
+        };
+
+    UIRenderer renderer(
+        WIDTH,
+        HEIGHT);
+
+    mfb_set_char_input_callback(
+        [](struct mfb_window *window_pointer,
+           unsigned int character) {
+
+            ui_bridge_char_input(
+                window_pointer,
+                character);
+        },
+        window);
+
+    bool quit_requested =
+        false;
+
+    bool rotating_model =
+        false;
+
+    bool previous_left_down =
+        false;
+
+    int previous_mouse_x = 0;
+    int previous_mouse_y = 0;
+
+    while (
+        mfb_update_events(window) !=
+        MFB_STATE_EXIT) {
+
+        auto frame_start_time =
+            std::chrono::high_resolution_clock::now();
+
+        ui_bridge_input(
+            ctx,
+            window,
+            WIDTH,
+            HEIGHT);
+
+        active_model =
+            std::clamp(
+                active_model,
+                0,
+                static_cast<int>(
+                    meshes.size()) -
+                    1);
+
+        Mesh &active_mesh =
+            meshes[active_model];
+
+        const uint8_t *keys =
+            mfb_get_key_buffer(
+                window);
+
+        constexpr float camera_speed =
+            0.035f;
+
+        if (keys[MFB_KB_KEY_LEFT]) {
+            camera.position.x -=
+                camera_speed;
+        }
+
+        if (keys[MFB_KB_KEY_RIGHT]) {
+            camera.position.x +=
+                camera_speed;
+        }
+
+        if (keys[MFB_KB_KEY_UP]) {
+            camera.position.y +=
+                camera_speed;
+        }
+
+        if (keys[MFB_KB_KEY_DOWN]) {
+            camera.position.y -=
+                camera_speed;
+        }
+
+        if (keys[MFB_KB_KEY_W]) {
+            camera.position.z -=
+                camera_speed;
+        }
+
+        if (keys[MFB_KB_KEY_S]) {
+            camera.position.z +=
+                camera_speed;
+        }
+
+        bool mouse_inside_scene =
+            ctx->mouse_pos.x >
+                UI_WIDTH &&
+            ctx->mouse_pos.x <
+                WIDTH &&
+            ctx->mouse_pos.y >= 0 &&
+            ctx->mouse_pos.y <
+                HEIGHT;
+
+        bool left_down =
+            (
+                ctx->mouse_down &
+                MU_MOUSE_LEFT
+            ) != 0;
+
+        if (left_down &&
+            !previous_left_down &&
+            mouse_inside_scene) {
+
+            rotating_model =
+                true;
+
+            previous_mouse_x =
+                ctx->mouse_pos.x;
+
+            previous_mouse_y =
+                ctx->mouse_pos.y;
+        }
+
+        if (!left_down) {
+            rotating_model =
+                false;
+        }
+
+        if (rotating_model &&
+            left_down) {
+
+            int delta_x =
+                ctx->mouse_pos.x -
+                previous_mouse_x;
+
+            int delta_y =
+                ctx->mouse_pos.y -
+                previous_mouse_y;
+
+            active_mesh.transform
+                .rotation.y +=
+                static_cast<float>(
+                    delta_x) *
+                0.55f;
+
+            active_mesh.transform
+                .rotation.x +=
+                static_cast<float>(
+                    delta_y) *
+                0.55f;
+
+            previous_mouse_x =
+                ctx->mouse_pos.x;
+
+            previous_mouse_y =
+                ctx->mouse_pos.y;
+        }
+
+        previous_left_down =
+            left_down;
+
+        glm::mat4 view =
+            view_matrix(camera);
+
+        glm::mat4 projection =
+            projection_matrix(camera);
+
+        g_shadow_filter_radius =
+            std::clamp(shadow_quality, 0, 2);
+
+        auto shadow_start_time =
+            std::chrono::high_resolution_clock::now();
+
+        if (shadows_enabled || show_shadow_map) {
+            render_shadow_map(
+                meshes,
+                ground,
+                light,
+                shadow_map);
+        }
+
+        auto shadow_end_time =
+            std::chrono::high_resolution_clock::now();
+
+        shadow_time_ms =
+            std::chrono::duration<double, std::milli>(
+                shadow_end_time - shadow_start_time).count();
+
+        clear_background();
+        clear_z_buffer();
+
+        // Render the ground separately as a two-sided shadow receiver.
+        render_mesh(
+            ground,
+            camera,
+            light,
+            texture,
+            view,
+            projection,
+            shading_mode,
+            false,
+            ambient_enabled != 0,
+            diffuse_enabled != 0,
+            specular_enabled != 0,
+            false,
+            false,
+            false,
+            false,
+            shadows_enabled != 0,
+            shadow_map);
+
+        for (std::size_t i = 0;
+             i < meshes.size();
+             i++) {
+
+            render_mesh(
+                meshes[i],
+                camera,
+                light,
+                texture,
+                view,
+                projection,
+                shading_mode,
+                texture_enabled != 0,
+                ambient_enabled != 0,
+                diffuse_enabled != 0,
+                specular_enabled != 0,
+                backface_culling != 0,
+                wireframe_overlay != 0,
+                debug_vectors != 0,
+                static_cast<int>(i) ==
+                    active_model,
+                shadows_enabled != 0,
+                shadow_map);
+        }
+
+        if (show_shadow_map) {
+            draw_shadow_map_debug(shadow_map);
+        }
+
+        mu_begin(ctx);
+
+        if (mu_begin_window(
+                ctx,
+                "Lighting Controls",
+                mu_rect(
+                    15,
+                    15,
+                    415,
+                    1160))) {
+
+            int full_width[] = {-1};
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_label(
+                ctx,
+                "Final Project: Interactive Scene Editor + Shadows");
+
+            mu_text(
+                ctx,
+                "Left drag rotates the selected model. "
+                "Arrow keys move camera X/Y. "
+                "W and S move camera Z.");
+
+            gui_label(
+                ctx,
+                "SCENE OBJECTS (max 10)");
+
+            int add_widths[] =
+                {115, 115, 115};
+
+            mu_layout_row(
+                ctx,
+                3,
+                add_widths,
+                0);
+
+            if (mu_button(
+                    ctx,
+                    "+ Cube")) {
+
+                if (add_model_to_scene(
+                        meshes,
+                        MODEL_CATALOG[0],
+                        models_added_count)) {
+
+                    active_model =
+                        static_cast<int>(
+                            meshes.size()) -
+                        1;
+                }
+            }
+
+            if (mu_button(
+                    ctx,
+                    "+ Pyramid")) {
+
+                if (add_model_to_scene(
+                        meshes,
+                        MODEL_CATALOG[1],
+                        models_added_count)) {
+
+                    active_model =
+                        static_cast<int>(
+                            meshes.size()) -
+                        1;
+                }
+            }
+
+            if (mu_button(
+                    ctx,
+                    "+ Octahedron")) {
+
+                if (add_model_to_scene(
+                        meshes,
+                        MODEL_CATALOG[2],
+                        models_added_count)) {
+
+                    active_model =
+                        static_cast<int>(
+                            meshes.size()) -
+                        1;
+                }
+            }
+
+            mu_layout_row(
+                ctx,
+                3,
+                add_widths,
+                0);
+
+            if (mu_button(
+                    ctx,
+                    "Duplicate")) {
+
+                if (meshes.size() <
+                    MAX_SCENE_OBJECTS) {
+
+                    Mesh clone =
+                        meshes[active_model];
+
+                    clone.name += " (copy)";
+
+                    clone.transform
+                        .translation +=
+                        glm::vec3(
+                            0.45f,
+                            0.0f,
+                            0.45f);
+
+                    meshes.push_back(clone);
+
+                    active_model =
+                        static_cast<int>(
+                            meshes.size()) -
+                        1;
+                }
+            }
+
+            if (mu_button(
+                    ctx,
+                    "Remove")) {
+
+                if (meshes.size() > 1) {
+                    meshes.erase(
+                        meshes.begin() +
+                        active_model);
+
+                    if (active_model >=
+                        static_cast<int>(
+                            meshes.size())) {
+
+                        active_model =
+                            static_cast<int>(
+                                meshes.size()) -
+                            1;
+                    }
+                }
+            }
+
+            if (mu_button(
+                    ctx,
+                    "Auto-Layout")) {
+
+                for (std::size_t i = 0;
+                     i < meshes.size();
+                     i++) {
+
+                    glm::vec3 rotation =
+                        meshes[i]
+                            .transform
+                            .rotation;
+
+                    reset_transform(
+                        meshes[i].transform);
+
+                    meshes[i]
+                        .transform
+                        .translation =
+                        scene_grid_position(i);
+
+                    meshes[i]
+                        .transform
+                        .rotation =
+                        rotation;
+
+                    place_mesh_on_ground(
+                        meshes[i]);
+                }
+            }
+
+            gui_label(
+                ctx,
+                "SELECT ACTIVE OBJECT");
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            for (std::size_t i = 0;
+                 i < meshes.size();
+                 i++) {
+
+                char list_label[80];
+
+                std::snprintf(
+                    list_label,
+                    sizeof(list_label),
+                    "%s %s",
+                    static_cast<int>(i) ==
+                            active_model
+                        ? ">"
+                        : " ",
+                    meshes[i].name.c_str());
+
+                if (mu_button(
+                        ctx,
+                        list_label)) {
+
+                    active_model =
+                        static_cast<int>(i);
+                }
+            }
+
+            Mesh &selected =
+                meshes[active_model];
+
+            char selected_text[128];
+
+            std::snprintf(
+                selected_text,
+                sizeof(selected_text),
+                "Selected model: %s",
+                selected.name.c_str());
+
+            gui_label(
+                ctx,
+                selected_text);
+
+            gui_label(
+                ctx,
+                "SHADING MODE");
+
+            int shading_widths[] =
+                {115, 115, 115};
+
+            mu_layout_row(
+                ctx,
+                3,
+                shading_widths,
+                0);
+
+            if (mu_button(
+                    ctx,
+                    "Flat")) {
+
+                shading_mode =
+                    ShadingMode::Flat;
+            }
+
+            if (mu_button(
+                    ctx,
+                    "Gouraud")) {
+
+                shading_mode =
+                    ShadingMode::Gouraud;
+            }
+
+            if (mu_button(
+                    ctx,
+                    "Phong")) {
+
+                shading_mode =
+                    ShadingMode::Phong;
+            }
+
+            const char *mode_name =
+                shading_mode ==
+                        ShadingMode::Flat
+                    ? "Current: Flat"
+                    : shading_mode ==
+                              ShadingMode::Gouraud
+                          ? "Current: Gouraud"
+                          : "Current: Phong";
+
+            gui_label(
+                ctx,
+                mode_name);
+
+            gui_label(
+                ctx,
+                "LIGHTING COMPONENTS");
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Ambient",
+                &ambient_enabled);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Diffuse",
+                &diffuse_enabled);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Specular",
+                &specular_enabled);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Backface Culling",
+                &backface_culling);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Wireframe Overlay",
+                &wireframe_overlay);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Show Light/Reflection Vectors",
+                &debug_vectors);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Enable Texture Mapping",
+                &texture_enabled);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Enable Shadows (Shadow Mapping)",
+                &shadows_enabled);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Show Shadow Map (Depth Debug)",
+                &show_shadow_map);
+
+            gui_label(
+                ctx,
+                "SHADOW QUALITY");
+
+            int shadow_widths[] =
+                {115, 115, 115};
+
+            mu_layout_row(
+                ctx,
+                3,
+                shadow_widths,
+                0);
+
+            if (mu_button(ctx, "Hard")) {
+                shadow_quality = 0;
+            }
+
+            if (mu_button(ctx, "PCF 3x3")) {
+                shadow_quality = 1;
+            }
+
+            if (mu_button(ctx, "PCF 5x5")) {
+                shadow_quality = 2;
+            }
+
+            const char *shadow_quality_name =
+                shadow_quality == 0
+                    ? "Current: Hard Shadows"
+                    : shadow_quality == 1
+                          ? "Current: PCF 3x3"
+                          : "Current: PCF 5x5";
+
+            gui_label(
+                ctx,
+                shadow_quality_name);
+
+            gui_label(
+                ctx,
+                "SHADOW-CASTING LIGHT POSITION");
+
+            gui_slider(
+                ctx,
+                "Light X",
+                light.position.x,
+                -6.0f,
+                6.0f);
+
+            gui_slider(
+                ctx,
+                "Light Y",
+                light.position.y,
+                -6.0f,
+                6.0f);
+
+            gui_slider(
+                ctx,
+                "Light Z",
+                light.position.z,
+                -2.0f,
+                10.0f);
+
+            gui_label(
+                ctx,
+                "LIGHT INTENSITIES");
+
+            gui_slider(
+                ctx,
+                "Ambient R",
+                light.ambient.r,
+                0.0f,
+                1.0f);
+
+            gui_slider(
+                ctx,
+                "Ambient G",
+                light.ambient.g,
+                0.0f,
+                1.0f);
+
+            gui_slider(
+                ctx,
+                "Ambient B",
+                light.ambient.b,
+                0.0f,
+                1.0f);
+
+            gui_slider(
+                ctx,
+                "Diffuse R",
+                light.diffuse.r,
+                0.0f,
+                1.0f);
+
+            gui_slider(
+                ctx,
+                "Diffuse G",
+                light.diffuse.g,
+                0.0f,
+                1.0f);
+
+            gui_slider(
+                ctx,
+                "Diffuse B",
+                light.diffuse.b,
+                0.0f,
+                1.0f);
+
+            gui_slider(
+                ctx,
+                "Specular R",
+                light.specular.r,
+                0.0f,
+                1.0f);
+
+            gui_slider(
+                ctx,
+                "Specular G",
+                light.specular.g,
+                0.0f,
+                1.0f);
+
+            gui_slider(
+                ctx,
+                "Specular B",
+                light.specular.b,
+                0.0f,
+                1.0f);
+
+            gui_label(
+                ctx,
+                "MATERIAL");
+
+            gui_slider(
+                ctx,
+                "Ambient Strength",
+                selected.material.ambient.r,
+                0.0f,
+                1.0f);
+
+            selected.material.ambient.g =
+                selected.material.ambient.r;
+
+            selected.material.ambient.b =
+                selected.material.ambient.r;
+
+            gui_slider(
+                ctx,
+                "Diffuse Strength",
+                selected.material.diffuse.r,
+                0.0f,
+                1.0f);
+
+            selected.material.diffuse.g =
+                selected.material.diffuse.r;
+
+            selected.material.diffuse.b =
+                selected.material.diffuse.r;
+
+            gui_slider(
+                ctx,
+                "Shininess",
+                selected.material.shininess,
+                1.0f,
+                128.0f);
+
+            gui_label(
+                ctx,
+                "PERFORMANCE");
+
+            char performance_text[128];
+            std::snprintf(
+                performance_text,
+                sizeof(performance_text),
+                "FPS: %.1f | Frame: %.2f ms | Shadow: %.2f ms",
+                fps,
+                frame_time_ms,
+                shadow_time_ms);
+            gui_label(
+                ctx,
+                performance_text);
+
+            gui_label(
+                ctx,
+                "CAMERA");
+
+            gui_slider(
+                ctx,
+                "Camera X",
+                camera.position.x,
+                -8.0f,
+                8.0f);
+
+            gui_slider(
+                ctx,
+                "Camera Y",
+                camera.position.y,
+                -8.0f,
+                8.0f);
+
+            gui_slider(
+                ctx,
+                "Camera Z",
+                camera.position.z,
+                2.0f,
+                18.0f);
+
+            gui_slider(
+                ctx,
+                "Field of View",
+                camera.field_of_view,
+                15.0f,
+                110.0f);
+
+            gui_label(
+                ctx,
+                "MODEL TRANSFORM");
+
+            gui_slider(
+                ctx,
+                "Translate X",
+                selected.transform.translation.x,
+                -3.0f,
+                3.0f);
+
+            gui_slider(
+                ctx,
+                "Translate Y",
+                selected.transform.translation.y,
+                -3.0f,
+                3.0f);
+
+            gui_slider(
+                ctx,
+                "Translate Z",
+                selected.transform.translation.z,
+                -3.0f,
+                3.0f);
+
+            gui_slider(
+                ctx,
+                "Rotate X",
+                selected.transform.rotation.x,
+                -180.0f,
+                180.0f);
+
+            gui_slider(
+                ctx,
+                "Rotate Y",
+                selected.transform.rotation.y,
+                -180.0f,
+                180.0f);
+
+            gui_slider(
+                ctx,
+                "Rotate Z",
+                selected.transform.rotation.z,
+                -180.0f,
+                180.0f);
+
+            gui_slider(
+                ctx,
+                "Scale",
+                selected.transform.scale.x,
+                0.2f,
+                2.5f);
+
+            selected.transform.scale.y =
+                selected.transform.scale.x;
+
+            selected.transform.scale.z =
+                selected.transform.scale.x;
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            if (mu_button(
+                    ctx,
+                    "Reset Active Model")) {
+
+                reset_transform(
+                    selected.transform);
+
+                place_mesh_on_ground(
+                    selected);
+            }
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            if (mu_button(
+                    ctx,
+                    "Reset Camera")) {
+
+                reset_camera(camera);
+            }
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            if (mu_button(
+                    ctx,
+                    "Quit")) {
+
+                quit_requested =
+                    true;
+            }
+
+            mu_end_window(ctx);
+        }
+
+        mu_end(ctx);
+
+        if (quit_requested) {
+            mfb_close(window);
+            break;
+        }
+
+        renderer.render(
+            ctx,
+            g_buffer);
+
+        mfb_update_state state =
+            mfb_update_ex(
+                window,
+                g_buffer,
+                WIDTH,
+                HEIGHT);
+
+        if (state < 0) {
+            break;
+        }
+
+        auto frame_end_time =
+            std::chrono::high_resolution_clock::now();
+
+        frame_time_ms =
+            std::chrono::duration<double, std::milli>(
+                frame_end_time - frame_start_time).count();
+
+        fps = frame_time_ms > 0.0001
+                  ? 1000.0 / frame_time_ms
+                  : 0.0;
+
+        mfb_wait_sync(window);
+    }
+
+    mfb_close(window);
+    std::free(ctx);
+
+    return 0;
+}
 
