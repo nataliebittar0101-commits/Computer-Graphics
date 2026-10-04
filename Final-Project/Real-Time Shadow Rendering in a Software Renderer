@@ -2093,3 +2093,208 @@ void rasterize_shadow_triangle(
         }
     }
 }
+void render_shadow_map(
+    const std::vector<Mesh> &meshes,
+    const Mesh &ground,
+    const SceneLight &light,
+    ShadowMap &shadow_map) {
+
+    shadow_map.light_view =
+        light_view_matrix(light);
+
+    shadow_map.light_projection =
+        light_projection_matrix();
+
+    std::fill(
+        shadow_map.depth.begin(),
+        shadow_map.depth.end(),
+        1.0f);
+
+    auto render_shadow_casters =
+        [&](const Mesh &mesh) {
+            glm::mat4 model =
+                model_matrix(mesh);
+
+            for (const Face &face : mesh.faces) {
+                glm::vec3 world_a =
+                    glm::vec3(
+                        model *
+                        glm::vec4(mesh.vertices[face.a], 1.0f));
+
+                glm::vec3 world_b =
+                    glm::vec3(
+                        model *
+                        glm::vec4(mesh.vertices[face.b], 1.0f));
+
+                glm::vec3 world_c =
+                    glm::vec3(
+                        model *
+                        glm::vec4(mesh.vertices[face.c], 1.0f));
+
+                RasterVertex v0 =
+                    project_to_light_space(
+                        world_a,
+                        shadow_map.light_view,
+                        shadow_map.light_projection,
+                        shadow_map.size);
+
+                RasterVertex v1 =
+                    project_to_light_space(
+                        world_b,
+                        shadow_map.light_view,
+                        shadow_map.light_projection,
+                        shadow_map.size);
+
+                RasterVertex v2 =
+                    project_to_light_space(
+                        world_c,
+                        shadow_map.light_view,
+                        shadow_map.light_projection,
+                        shadow_map.size);
+
+                if (!v0.valid ||
+                    !v1.valid ||
+                    !v2.valid) {
+
+                    continue;
+                }
+
+                // Render both sides into the shadow map.
+                rasterize_shadow_triangle(
+                    v0,
+                    v1,
+                    v2,
+                    shadow_map);
+            }
+        };
+
+    for (const Mesh &mesh : meshes) {
+        render_shadow_casters(mesh);
+    }
+
+    render_shadow_casters(ground);
+}
+
+float sample_shadow(
+    const ShadowMap &shadow_map,
+    const glm::vec3 &world_position,
+    float n_dot_l) {
+
+    glm::vec4 view_position =
+        shadow_map.light_view *
+        glm::vec4(world_position, 1.0f);
+
+    glm::vec4 clip_position =
+        shadow_map.light_projection *
+        view_position;
+
+    if (clip_position.w <=
+        EPSILON) {
+
+        return 1.0f;
+    }
+
+    glm::vec3 ndc =
+        glm::vec3(clip_position) /
+        clip_position.w;
+
+    if (ndc.x < -1.0f || ndc.x > 1.0f ||
+        ndc.y < -1.0f || ndc.y > 1.0f ||
+        ndc.z < -1.0f || ndc.z > 1.0f) {
+
+        // Points outside the light frustum are treated as lit.
+        return 1.0f;
+    }
+
+    float u = ndc.x * 0.5f + 0.5f;
+    float v = 1.0f - (ndc.y * 0.5f + 0.5f);
+    float fragment_depth = ndc.z * 0.5f + 0.5f;
+
+    int size = shadow_map.size;
+
+    int center_x =
+        std::clamp(
+            static_cast<int>(u * static_cast<float>(size)),
+            0,
+            size - 1);
+
+    int center_y =
+        std::clamp(
+            static_cast<int>(v * static_cast<float>(size)),
+            0,
+            size - 1);
+
+    // Slope-dependent bias reduces self-shadowing artifacts.
+    float bias =
+        std::max(
+            0.0035f * (1.0f - n_dot_l),
+            0.0008f);
+
+    int lit_samples = 0;
+    int total_samples = 0;
+
+    // User-selectable shadow filtering:
+    // radius 0 = hard shadow, 1 = 3x3 PCF, 2 = 5x5 PCF.
+    int radius = std::clamp(g_shadow_filter_radius, 0, 2);
+
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            int sx = center_x + dx;
+            int sy = center_y + dy;
+
+            if (sx < 0 || sx >= size ||
+                sy < 0 || sy >= size) {
+
+                continue;
+            }
+
+            total_samples++;
+
+            float stored_depth =
+                shadow_map.depth[sy * size + sx];
+
+            if (fragment_depth - bias <=
+                stored_depth) {
+
+                lit_samples++;
+            }
+        }
+    }
+
+    if (total_samples == 0) {
+        return 1.0f;
+    }
+
+    return
+        static_cast<float>(lit_samples) /
+        static_cast<float>(total_samples);
+}
+
+void draw_shadow_map_debug(const ShadowMap &shadow_map) {
+    int view_x0 = UI_WIDTH + 2;
+    int view_width = WIDTH - view_x0;
+    int draw_size = std::min(view_width, HEIGHT);
+    int offset_x = view_x0 + (view_width - draw_size) / 2;
+    int offset_y = (HEIGHT - draw_size) / 2;
+
+    for (int y = 0; y < draw_size; y++) {
+        int sy = std::clamp(y * shadow_map.size / draw_size, 0, shadow_map.size - 1);
+        for (int x = 0; x < draw_size; x++) {
+            int sx = std::clamp(x * shadow_map.size / draw_size, 0, shadow_map.size - 1);
+            float depth = shadow_map.depth[sy * shadow_map.size + sx];
+
+            // Keep untouched far-depth pixels white, and increase contrast
+            // for geometry that was actually written by the shadow pass.
+            float value = depth >= 0.99999f
+                              ? 1.0f
+                              : glm::clamp((depth - 0.35f) / 0.65f, 0.0f, 1.0f);
+            uint8_t c = static_cast<uint8_t>(value * 255.0f);
+            g_buffer[(offset_y + y) * WIDTH + (offset_x + x)] = MFB_RGB(c, c, c);
+        }
+    }
+}
+
+// ============================================================
+// Mesh rendering
+// ============================================================
+

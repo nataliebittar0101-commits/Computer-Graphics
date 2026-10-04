@@ -1,7 +1,6 @@
 #include "MiniFB.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -9,12 +8,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include <glm/glm.hpp>
-#include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
 extern "C" {
@@ -26,11 +25,12 @@ extern "C" {
 
 #define WIDTH 1600
 #define HEIGHT 1200
-  constexpr int UI_WIDTH = 445;
-constexpr float PI_VALUE = 3.14159265358979323846f;
+
+constexpr int UI_WIDTH = 445;
+constexpr float EPSILON = 0.00001f;
 
 static uint32_t g_buffer[WIDTH * HEIGHT];
-
+static float g_z_buffer[WIDTH * HEIGHT];
 // ============================================================
 // Data structures
 // ============================================================
@@ -42,24 +42,16 @@ struct Face {
 };
 
 struct TransformState {
-    glm::vec3 local_translation{0.0f};
-    glm::vec3 local_rotation{0.0f};
-    glm::vec3 local_scale{1.0f};
-
-    glm::vec3 world_translation{0.0f};
-    glm::vec3 world_rotation{0.0f};
-    glm::vec3 world_scale{1.0f};
+    glm::vec3 translation{0.0f};
+    glm::vec3 rotation{0.0f};
+    glm::vec3 scale{1.0f};
 };
 
 struct Mesh {
     std::string name;
-    std::string filename;
 
     std::vector<glm::vec3> vertices;
     std::vector<Face> faces;
-
-    std::vector<glm::vec3> face_normals;
-    std::vector<glm::vec3> vertex_normals;
 
     glm::vec3 minimum{0.0f};
     glm::vec3 maximum{0.0f};
@@ -68,37 +60,99 @@ struct Mesh {
     float normalization_scale = 1.0f;
 
     TransformState transform;
-    uint32_t color = MFB_RGB(255, 255, 255);
 };
 
 struct Camera {
     glm::vec3 position{0.0f, 0.0f, 7.0f};
-    glm::vec3 rotation{0.0f};
-
-    glm::vec3 target{0.0f, 0.0f, 0.0f};
 
     float field_of_view = 60.0f;
     float near_plane = 0.1f;
     float far_plane = 100.0f;
 
-    bool use_look_at = false;
-    bool use_perspective = true;
+    bool perspective = true;
+};
 
-    bool dolly_zoom_enabled = false;
-    float dolly_zoom_value = 0.0f;
+struct RasterVertex {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+
+    glm::vec3 view_position{0.0f};
+
+    bool valid = false;
 };
 
 // ============================================================
-// Framebuffer helpers
+// Framebuffer
 // ============================================================
 
-void put_pixel(int x, int y, uint32_t color) {
-    if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
-        g_buffer[y * WIDTH + x] = color;
+void put_pixel(
+    int x,
+    int y,
+    uint32_t color) {
+
+    if (x < UI_WIDTH + 2 ||
+        x >= WIDTH ||
+        y < 0 ||
+        y >= HEIGHT) {
+
+        return;
+    }
+
+    g_buffer[y * WIDTH + x] = color;
+}
+
+void clear_background() {
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            float horizontal =
+                static_cast<float>(x) /
+                static_cast<float>(WIDTH);
+
+            float vertical =
+                static_cast<float>(y) /
+                static_cast<float>(HEIGHT);
+
+            uint8_t red =
+                static_cast<uint8_t>(
+                    12.0f +
+                    horizontal * 18.0f);
+
+            uint8_t green =
+                static_cast<uint8_t>(
+                    18.0f +
+                    vertical * 22.0f);
+
+            uint8_t blue =
+                static_cast<uint8_t>(
+                    38.0f +
+                    horizontal * 25.0f +
+                    vertical * 18.0f);
+
+            g_buffer[y * WIDTH + x] =
+                MFB_RGB(red, green, blue);
+        }
+    }
+
+    for (int y = 0; y < HEIGHT; y++) {
+        g_buffer[y * WIDTH + UI_WIDTH] =
+            MFB_RGB(120, 125, 145);
+
+        g_buffer[y * WIDTH + UI_WIDTH + 1] =
+            MFB_RGB(120, 125, 145);
     }
 }
 
-void draw_line_bresenham(
+void clear_z_buffer() {
+    float infinity =
+        std::numeric_limits<float>::infinity();
+
+    for (float &value : g_z_buffer) {
+        value = infinity;
+    }
+}
+
+void draw_line(
     int x0,
     int y0,
     int x1,
@@ -116,11 +170,14 @@ void draw_line_bresenham(
     while (true) {
         put_pixel(x0, y0, color);
 
-        if (x0 == x1 && y0 == y1) {
+        if (x0 == x1 &&
+            y0 == y1) {
+
             break;
         }
 
-        int doubled_error = 2 * error;
+        int doubled_error =
+            2 * error;
 
         if (doubled_error >= dy) {
             error += dy;
@@ -134,61 +191,57 @@ void draw_line_bresenham(
     }
 }
 
-void clear_background() {
-    for (int y = 0; y < HEIGHT; y++) {
-        for (int x = 0; x < WIDTH; x++) {
-            float horizontal =
-                static_cast<float>(x) /
-                static_cast<float>(WIDTH);
+// ============================================================
+// Model colors
+// ============================================================
 
-            float vertical =
-                static_cast<float>(y) /
-                static_cast<float>(HEIGHT);
+uint32_t face_color(
+    int mesh_index,
+    int face_index) {
 
-            uint8_t red =
-                static_cast<uint8_t>(
-                    10.0f + horizontal * 17.0f);
+    uint32_t seed =
+        static_cast<uint32_t>(
+            mesh_index * 92821 +
+            face_index * 68917 +
+            12345);
 
-            uint8_t green =
-                static_cast<uint8_t>(
-                    17.0f + vertical * 24.0f);
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
 
-            uint8_t blue =
-                static_cast<uint8_t>(
-                    31.0f +
-                    horizontal * 34.0f +
-                    vertical * 15.0f);
+    uint8_t red =
+        static_cast<uint8_t>(
+            65 + seed % 180);
 
-            g_buffer[y * WIDTH + x] =
-                MFB_RGB(red, green, blue);
-        }
-    }
+    uint8_t green =
+        static_cast<uint8_t>(
+            65 + (seed >> 8) % 180);
 
-    for (int y = 0; y < HEIGHT; y++) {
-        put_pixel(
-            UI_WIDTH,
-            y,
-            MFB_RGB(100, 110, 135));
+    uint8_t blue =
+        static_cast<uint8_t>(
+            65 + (seed >> 16) % 180);
 
-        put_pixel(
-            UI_WIDTH + 1,
-            y,
-            MFB_RGB(100, 110, 135));
-    }
+    return MFB_RGB(
+        red,
+        green,
+        blue);
 }
 
 // ============================================================
-// Default OBJ files
+// Default OBJ models
 // ============================================================
 
-void create_default_obj_files() {
-    std::filesystem::create_directories("models");
+void create_default_models() {
+    std::filesystem::create_directories(
+        "models");
 
-    if (!std::filesystem::exists("models/cube.obj")) {
-        std::ofstream file("models/cube.obj");
+    if (!std::filesystem::exists(
+            "models/cube.obj")) {
+
+        std::ofstream file(
+            "models/cube.obj");
 
         file <<
-            "# Cube\n"
             "v -1 -1 -1\n"
             "v  1 -1 -1\n"
             "v  1  1 -1\n"
@@ -197,32 +250,42 @@ void create_default_obj_files() {
             "v  1 -1  1\n"
             "v  1  1  1\n"
             "v -1  1  1\n"
+
             "f 1 2 3\n"
             "f 1 3 4\n"
+
             "f 5 7 6\n"
             "f 5 8 7\n"
+
             "f 1 5 6\n"
             "f 1 6 2\n"
+
             "f 4 3 7\n"
             "f 4 7 8\n"
+
             "f 1 4 8\n"
             "f 1 8 5\n"
+
             "f 2 6 7\n"
             "f 2 7 3\n";
     }
 
-    if (!std::filesystem::exists("models/pyramid.obj")) {
-        std::ofstream file("models/pyramid.obj");
+    if (!std::filesystem::exists(
+            "models/pyramid.obj")) {
+
+        std::ofstream file(
+            "models/pyramid.obj");
 
         file <<
-            "# Pyramid\n"
             "v -1 -1 -1\n"
             "v  1 -1 -1\n"
             "v  1 -1  1\n"
             "v -1 -1  1\n"
             "v  0  1  0\n"
+
             "f 1 2 3\n"
             "f 1 3 4\n"
+
             "f 1 5 2\n"
             "f 2 5 3\n"
             "f 3 5 4\n"
@@ -236,47 +299,48 @@ void create_default_obj_files() {
             "models/octahedron.obj");
 
         file <<
-            "# Octahedron\n"
             "v  1  0  0\n"
             "v -1  0  0\n"
             "v  0  1  0\n"
             "v  0 -1  0\n"
             "v  0  0  1\n"
             "v  0  0 -1\n"
+
             "f 1 3 5\n"
             "f 3 2 5\n"
             "f 2 4 5\n"
             "f 4 1 5\n"
+
             "f 3 1 6\n"
             "f 2 3 6\n"
             "f 4 2 6\n"
             "f 1 4 6\n";
     }
 }
-
 // ============================================================
-// OBJ loading and geometry calculations
+// OBJ loading
 // ============================================================
 
 int parse_obj_index(
     const std::string &token,
     int vertex_count) {
 
-    std::string index_text = token;
+    std::string text = token;
 
     std::size_t slash =
-        index_text.find('/');
+        text.find('/');
 
     if (slash != std::string::npos) {
-        index_text =
-            index_text.substr(0, slash);
+        text =
+            text.substr(0, slash);
     }
 
-    if (index_text.empty()) {
+    if (text.empty()) {
         return -1;
     }
 
-    int index = std::stoi(index_text);
+    int index =
+        std::stoi(text);
 
     if (index > 0) {
         return index - 1;
@@ -289,96 +353,55 @@ int parse_obj_index(
     return -1;
 }
 
-void calculate_bounding_box(Mesh &mesh) {
+void calculate_mesh_bounds(
+    Mesh &mesh) {
+
     if (mesh.vertices.empty()) {
-        mesh.minimum = glm::vec3(0.0f);
-        mesh.maximum = glm::vec3(0.0f);
-        mesh.center = glm::vec3(0.0f);
-        mesh.normalization_scale = 1.0f;
         return;
     }
 
-    mesh.minimum = mesh.vertices.front();
-    mesh.maximum = mesh.vertices.front();
+    mesh.minimum =
+        mesh.vertices.front();
 
-    for (const glm::vec3 &vertex : mesh.vertices) {
+    mesh.maximum =
+        mesh.vertices.front();
+
+    for (const glm::vec3 &vertex :
+         mesh.vertices) {
+
         mesh.minimum =
-            glm::min(mesh.minimum, vertex);
+            glm::min(
+                mesh.minimum,
+                vertex);
 
         mesh.maximum =
-            glm::max(mesh.maximum, vertex);
+            glm::max(
+                mesh.maximum,
+                vertex);
     }
 
     mesh.center =
-        (mesh.minimum + mesh.maximum) * 0.5f;
+        (mesh.minimum +
+         mesh.maximum) *
+        0.5f;
 
     glm::vec3 dimensions =
-        mesh.maximum - mesh.minimum;
+        mesh.maximum -
+        mesh.minimum;
 
-    float largest_dimension =
+    float largest =
         std::max({
             dimensions.x,
             dimensions.y,
             dimensions.z
         });
 
-    if (largest_dimension < 0.0001f) {
-        largest_dimension = 1.0f;
+    if (largest < EPSILON) {
+        largest = 1.0f;
     }
 
     mesh.normalization_scale =
-        2.0f / largest_dimension;
-}
-
-void calculate_normals(Mesh &mesh) {
-    mesh.face_normals.clear();
-
-    mesh.vertex_normals.assign(
-        mesh.vertices.size(),
-        glm::vec3(0.0f));
-
-    for (const Face &face : mesh.faces) {
-        const glm::vec3 &a =
-            mesh.vertices[face.a];
-
-        const glm::vec3 &b =
-            mesh.vertices[face.b];
-
-        const glm::vec3 &c =
-            mesh.vertices[face.c];
-
-        glm::vec3 edge_ab = b - a;
-        glm::vec3 edge_ac = c - a;
-
-        glm::vec3 normal =
-            glm::cross(edge_ab, edge_ac);
-
-        float length =
-            glm::length(normal);
-
-        if (length > 0.0001f) {
-            normal /= length;
-        } else {
-            normal = glm::vec3(0.0f);
-        }
-
-        mesh.face_normals.push_back(normal);
-
-        mesh.vertex_normals[face.a] += normal;
-        mesh.vertex_normals[face.b] += normal;
-        mesh.vertex_normals[face.c] += normal;
-    }
-
-    for (glm::vec3 &normal :
-         mesh.vertex_normals) {
-
-        float length =
-            glm::length(normal);
-
-        if (length > 0.0001f) {
-            normal /= length;
-        }
-    }
+        2.0f / largest;
 }
 
 bool load_obj(
@@ -389,26 +412,27 @@ bool load_obj(
 
     if (!file.is_open()) {
         std::printf(
-            "Could not open OBJ file: %s\n",
+            "Could not open %s\n",
             filename.c_str());
 
         return false;
     }
 
-    mesh.filename = filename;
     mesh.vertices.clear();
     mesh.faces.clear();
 
     std::string line;
 
     while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#') {
+        if (line.empty() ||
+            line[0] == '#') {
+
             continue;
         }
 
         std::istringstream stream(line);
-        std::string type;
 
+        std::string type;
         stream >> type;
 
         if (type == "v") {
@@ -420,7 +444,8 @@ bool load_obj(
                 vertex.z;
 
             if (!stream.fail()) {
-                mesh.vertices.push_back(vertex);
+                mesh.vertices.push_back(
+                    vertex);
             }
         }
 
@@ -457,91 +482,59 @@ bool load_obj(
         }
     }
 
-    calculate_bounding_box(mesh);
-    calculate_normals(mesh);
+    calculate_mesh_bounds(mesh);
 
     std::printf(
-        "Loaded %s: %zu vertices, %zu faces\n",
+        "Loaded %s: %zu vertices, %zu triangles\n",
         filename.c_str(),
         mesh.vertices.size(),
         mesh.faces.size());
 
-    return !mesh.vertices.empty() &&
-           !mesh.faces.empty();
+    return
+        !mesh.vertices.empty() &&
+        !mesh.faces.empty();
 }
 
 // ============================================================
-// Transformation matrices
+// Matrices
 // ============================================================
 
-glm::mat4 create_rotation_matrix(
-    const glm::vec3 &rotation_degrees) {
+glm::mat4 rotation_matrix(
+    const glm::vec3 &rotation) {
 
     glm::mat4 matrix(1.0f);
 
-    matrix = glm::rotate(
-        matrix,
-        glm::radians(rotation_degrees.x),
-        glm::vec3(1.0f, 0.0f, 0.0f));
+    matrix =
+        glm::rotate(
+            matrix,
+            glm::radians(rotation.x),
+            glm::vec3(
+                1.0f,
+                0.0f,
+                0.0f));
 
-    matrix = glm::rotate(
-        matrix,
-        glm::radians(rotation_degrees.y),
-        glm::vec3(0.0f, 1.0f, 0.0f));
+    matrix =
+        glm::rotate(
+            matrix,
+            glm::radians(rotation.y),
+            glm::vec3(
+                0.0f,
+                1.0f,
+                0.0f));
 
-    matrix = glm::rotate(
-        matrix,
-        glm::radians(rotation_degrees.z),
-        glm::vec3(0.0f, 0.0f, 1.0f));
+    matrix =
+        glm::rotate(
+            matrix,
+            glm::radians(rotation.z),
+            glm::vec3(
+                0.0f,
+                0.0f,
+                1.0f));
 
     return matrix;
 }
 
-glm::mat4 create_local_world_matrix(
-    const Mesh &mesh) {
-
-    glm::mat4 local_translation =
-        glm::translate(
-            glm::mat4(1.0f),
-            mesh.transform.local_translation);
-
-    glm::mat4 local_rotation =
-        create_rotation_matrix(
-            mesh.transform.local_rotation);
-
-    glm::mat4 local_scale =
-        glm::scale(
-            glm::mat4(1.0f),
-            mesh.transform.local_scale);
-
-    glm::mat4 world_translation =
-        glm::translate(
-            glm::mat4(1.0f),
-            mesh.transform.world_translation);
-
-    glm::mat4 world_rotation =
-        create_rotation_matrix(
-            mesh.transform.world_rotation);
-
-    glm::mat4 world_scale =
-        glm::scale(
-            glm::mat4(1.0f),
-            mesh.transform.world_scale);
-
-    glm::mat4 local_matrix =
-        local_translation *
-        local_rotation *
-        local_scale;
-
-    glm::mat4 world_matrix =
-        world_translation *
-        world_rotation *
-        world_scale;
-
-    return world_matrix * local_matrix;
-}
-
-glm::mat4 create_model_matrix(
+glm::mat4 model_matrix(
     const Mesh &mesh) {
 
     glm::mat4 normalization(1.0f);
@@ -557,474 +550,489 @@ glm::mat4 create_model_matrix(
             normalization,
             -mesh.center);
 
-    return create_local_world_matrix(mesh) *
-           normalization;
-}
-   // ============================================================
-// Camera and projection
-// ============================================================
+    glm::mat4 translation =
+        glm::translate(
+            glm::mat4(1.0f),
+            mesh.transform.translation);
 
-glm::mat4 create_view_matrix(
+    glm::mat4 rotation =
+        rotation_matrix(
+            mesh.transform.rotation);
+
+    glm::mat4 scale =
+        glm::scale(
+            glm::mat4(1.0f),
+            mesh.transform.scale);
+
+    return
+        translation *
+        rotation *
+        scale *
+        normalization;
+}
+
+glm::mat4 view_matrix(
     const Camera &camera) {
 
-    if (camera.use_look_at) {
-        glm::vec3 forward =
-            camera.target -
-            camera.position;
-
-        if (glm::length(forward) < 0.0001f) {
-            forward =
-                glm::vec3(
-                    0.0f,
-                    0.0f,
-                    -1.0f);
-        }
-
-        return glm::lookAt(
-            camera.position,
-            camera.target,
-            glm::vec3(0.0f, 1.0f, 0.0f));
-    }
-
-    glm::mat4 camera_transform(1.0f);
-
-    camera_transform =
-        glm::translate(
-            camera_transform,
-            camera.position);
-
-    camera_transform *=
-        create_rotation_matrix(
-            camera.rotation);
-
-    return glm::inverse(camera_transform);
+    return glm::lookAt(
+        camera.position,
+        glm::vec3(0.0f),
+        glm::vec3(
+            0.0f,
+            1.0f,
+            0.0f));
 }
 
-glm::mat4 create_projection_matrix(
+glm::mat4 projection_matrix(
     const Camera &camera) {
 
     float viewport_width =
         static_cast<float>(
             WIDTH - UI_WIDTH);
 
-    float viewport_height =
+    float aspect =
+        viewport_width /
         static_cast<float>(HEIGHT);
 
-    float aspect_ratio =
-        viewport_width / viewport_height;
-
-    if (camera.use_perspective) {
+    if (camera.perspective) {
         return glm::perspective(
             glm::radians(
                 camera.field_of_view),
-            aspect_ratio,
+            aspect,
             camera.near_plane,
             camera.far_plane);
     }
 
-    constexpr float ortho_height = 3.4f;
-    float ortho_width =
-        ortho_height * aspect_ratio;
+    constexpr float height = 3.5f;
+
+    float width =
+        height * aspect;
 
     return glm::ortho(
-        -ortho_width,
-        ortho_width,
-        -ortho_height,
-        ortho_height,
+        -width,
+        width,
+        -height,
+        height,
         camera.near_plane,
         camera.far_plane);
 }
 
-void apply_dolly_zoom(Camera &camera) {
-    if (!camera.dolly_zoom_enabled) {
-        return;
-    }
-
-    constexpr float base_distance = 7.0f;
-    constexpr float base_fov = 60.0f;
-
-    float distance =
-        base_distance +
-        camera.dolly_zoom_value;
-
-    distance =
-        std::clamp(
-            distance,
-            2.0f,
-            18.0f);
-
-    camera.position.z = distance;
-
-    float constant =
-        base_distance *
-        std::tan(
-            glm::radians(base_fov) *
-            0.5f);
-
-    float new_fov_radians =
-        2.0f *
-        std::atan(
-            constant / distance);
-
-    camera.field_of_view =
-        glm::degrees(new_fov_radians);
-
-    camera.field_of_view =
-        std::clamp(
-            camera.field_of_view,
-            15.0f,
-            110.0f);
-}
-
 // ============================================================
-// Projection helpers
+// Projection
 // ============================================================
 
-bool project_point(
-    const glm::vec3 &world_point,
-    const glm::mat4 &view_matrix,
-    const glm::mat4 &projection_matrix,
-    glm::ivec2 &screen_point) {
+RasterVertex project_vertex(
+    const glm::vec3 &world_vertex,
+    const glm::mat4 &view,
+    const glm::mat4 &projection) {
+
+    RasterVertex result;
+
+    glm::vec4 view_position =
+        view *
+        glm::vec4(
+            world_vertex,
+            1.0f);
 
     glm::vec4 clip =
-        projection_matrix *
-        view_matrix *
-        glm::vec4(world_point, 1.0f);
+        projection *
+        view_position;
 
-    if (std::abs(clip.w) < 0.00001f) {
-        return false;
+    if (std::abs(clip.w) <
+        EPSILON) {
+
+        return result;
     }
 
     if (clip.w <= 0.0f) {
-        return false;
+        return result;
     }
 
     glm::vec3 ndc =
-        glm::vec3(clip) / clip.w;
+        glm::vec3(clip) /
+        clip.w;
 
-    if (ndc.z < -1.2f ||
-        ndc.z > 1.2f) {
+    if (ndc.z < -1.0f ||
+        ndc.z > 1.0f) {
 
-        return false;
+        return result;
     }
 
     int viewport_width =
         WIDTH - UI_WIDTH;
 
-    int screen_x =
-        UI_WIDTH +
-        static_cast<int>(
-            (ndc.x * 0.5f + 0.5f) *
-            static_cast<float>(
-                viewport_width));
+    result.x =
+        static_cast<float>(
+            UI_WIDTH) +
+        (ndc.x * 0.5f + 0.5f) *
+        static_cast<float>(
+            viewport_width);
 
-    int screen_y =
-        static_cast<int>(
-            (1.0f -
-             (ndc.y * 0.5f + 0.5f)) *
-            static_cast<float>(HEIGHT));
+    result.y =
+        (1.0f -
+         (ndc.y * 0.5f + 0.5f)) *
+        static_cast<float>(HEIGHT);
 
-    screen_point =
-        glm::ivec2(screen_x, screen_y);
+    result.z =
+        ndc.z * 0.5f +
+        0.5f;
 
-    return true;
+    result.view_position =
+        glm::vec3(view_position);
+
+    result.valid = true;
+
+    return result;
 }
 
-void draw_projected_line(
-    const glm::vec3 &start,
-    const glm::vec3 &end,
-    const glm::mat4 &view_matrix,
-    const glm::mat4 &projection_matrix,
+// ============================================================
+// Barycentric rasterization
+// ============================================================
+
+float edge_function(
+    const RasterVertex &a,
+    const RasterVertex &b,
+    float x,
+    float y) {
+
+    return
+        (x - a.x) *
+        (b.y - a.y) -
+        (y - a.y) *
+        (b.x - a.x);
+}
+
+bool is_top_left(
+    const RasterVertex &a,
+    const RasterVertex &b) {
+
+    float dx =
+        b.x - a.x;
+
+    float dy =
+        b.y - a.y;
+
+    return
+        dy < 0.0f ||
+        (std::abs(dy) <= EPSILON &&
+         dx > 0.0f);
+}
+
+bool edge_inside(
+    float value,
+    bool top_left,
+    bool use_top_left_rule) {
+
+    if (!use_top_left_rule) {
+        return value >= -EPSILON;
+    }
+
+    if (value > EPSILON) {
+        return true;
+    }
+
+    if (std::abs(value) <= EPSILON) {
+        return top_left;
+    }
+
+    return false;
+}
+
+void triangle_bounds(
+    const RasterVertex &v0,
+    const RasterVertex &v1,
+    const RasterVertex &v2,
+    int &minimum_x,
+    int &maximum_x,
+    int &minimum_y,
+    int &maximum_y) {
+
+    minimum_x =
+        static_cast<int>(
+            std::floor(
+                std::min({
+                    v0.x,
+                    v1.x,
+                    v2.x
+                })));
+
+    maximum_x =
+        static_cast<int>(
+            std::ceil(
+                std::max({
+                    v0.x,
+                    v1.x,
+                    v2.x
+                })));
+
+    minimum_y =
+        static_cast<int>(
+            std::floor(
+                std::min({
+                    v0.y,
+                    v1.y,
+                    v2.y
+                })));
+
+    maximum_y =
+        static_cast<int>(
+            std::ceil(
+                std::max({
+                    v0.y,
+                    v1.y,
+                    v2.y
+                })));
+
+    minimum_x =
+        std::clamp(
+            minimum_x,
+            UI_WIDTH + 2,
+            WIDTH - 1);
+
+    maximum_x =
+        std::clamp(
+            maximum_x,
+            UI_WIDTH + 2,
+            WIDTH - 1);
+
+    minimum_y =
+        std::clamp(
+            minimum_y,
+            0,
+            HEIGHT - 1);
+
+    maximum_y =
+        std::clamp(
+            maximum_y,
+            0,
+            HEIGHT - 1);
+}
+
+void draw_triangle_bounding_box(
+    const RasterVertex &v0,
+    const RasterVertex &v1,
+    const RasterVertex &v2,
     uint32_t color) {
 
-    glm::ivec2 screen_start;
-    glm::ivec2 screen_end;
+    int minimum_x;
+    int maximum_x;
+    int minimum_y;
+    int maximum_y;
 
-    bool start_visible =
-        project_point(
-            start,
-            view_matrix,
-            projection_matrix,
-            screen_start);
+    triangle_bounds(
+        v0,
+        v1,
+        v2,
+        minimum_x,
+        maximum_x,
+        minimum_y,
+        maximum_y);
 
-    bool end_visible =
-        project_point(
-            end,
-            view_matrix,
-            projection_matrix,
-            screen_end);
+    for (int y = minimum_y;
+         y <= maximum_y;
+         y++) {
 
-    if (!start_visible || !end_visible) {
+        for (int x = minimum_x;
+             x <= maximum_x;
+             x++) {
+
+            put_pixel(
+                x,
+                y,
+                color);
+        }
+    }
+}
+
+void rasterize_triangle(
+    RasterVertex v0,
+    RasterVertex v1,
+    RasterVertex v2,
+    uint32_t color,
+    bool use_z_buffer,
+    bool use_top_left_rule) {
+
+    float area =
+        edge_function(
+            v0,
+            v1,
+            v2.x,
+            v2.y);
+
+    if (std::abs(area) <
+        EPSILON) {
+
         return;
     }
 
-    draw_line_bresenham(
-        screen_start.x,
-        screen_start.y,
-        screen_end.x,
-        screen_end.y,
-        color);
-}
-
-void draw_world_axes(
-    const glm::mat4 &view_matrix,
-    const glm::mat4 &projection_matrix) {
-
-    glm::vec3 origin(0.0f);
-
-    draw_projected_line(
-        origin,
-        glm::vec3(1.5f, 0.0f, 0.0f),
-        view_matrix,
-        projection_matrix,
-        MFB_RGB(255, 60, 60));
-
-    draw_projected_line(
-        origin,
-        glm::vec3(0.0f, 1.5f, 0.0f),
-        view_matrix,
-        projection_matrix,
-        MFB_RGB(60, 255, 80));
-
-    draw_projected_line(
-        origin,
-        glm::vec3(0.0f, 0.0f, 1.5f),
-        view_matrix,
-        projection_matrix,
-        MFB_RGB(80, 130, 255));
-}
-
-void draw_local_axes(
-    const Mesh &mesh,
-    const glm::mat4 &view_matrix,
-    const glm::mat4 &projection_matrix) {
-
-    glm::mat4 frame_matrix =
-        create_local_world_matrix(mesh);
-
-    glm::vec3 origin =
-        glm::vec3(
-            frame_matrix *
-            glm::vec4(
-                0.0f,
-                0.0f,
-                0.0f,
-                1.0f));
-
-    glm::vec3 x_end =
-        glm::vec3(
-            frame_matrix *
-            glm::vec4(
-                0.85f,
-                0.0f,
-                0.0f,
-                1.0f));
-
-    glm::vec3 y_end =
-        glm::vec3(
-            frame_matrix *
-            glm::vec4(
-                0.0f,
-                0.85f,
-                0.0f,
-                1.0f));
-
-    glm::vec3 z_end =
-        glm::vec3(
-            frame_matrix *
-            glm::vec4(
-                0.0f,
-                0.0f,
-                0.85f,
-                1.0f));
-
-    draw_projected_line(
-        origin,
-        x_end,
-        view_matrix,
-        projection_matrix,
-        MFB_RGB(255, 60, 60));
-
-    draw_projected_line(
-        origin,
-        y_end,
-        view_matrix,
-        projection_matrix,
-        MFB_RGB(60, 255, 80));
-
-    draw_projected_line(
-        origin,
-        z_end,
-        view_matrix,
-        projection_matrix,
-        MFB_RGB(80, 130, 255));
-}
-
-void draw_bounding_box(
-    const Mesh &mesh,
-    const glm::mat4 &view_matrix,
-    const glm::mat4 &projection_matrix) {
-
-    glm::mat4 model_matrix =
-        create_model_matrix(mesh);
-
-    const glm::vec3 &minimum =
-        mesh.minimum;
-
-    const glm::vec3 &maximum =
-        mesh.maximum;
-
-    std::array<glm::vec3, 8> local_corners = {
-        glm::vec3(minimum.x, minimum.y, minimum.z),
-        glm::vec3(maximum.x, minimum.y, minimum.z),
-        glm::vec3(maximum.x, maximum.y, minimum.z),
-        glm::vec3(minimum.x, maximum.y, minimum.z),
-        glm::vec3(minimum.x, minimum.y, maximum.z),
-        glm::vec3(maximum.x, minimum.y, maximum.z),
-        glm::vec3(maximum.x, maximum.y, maximum.z),
-        glm::vec3(minimum.x, maximum.y, maximum.z)
-    };
-
-    std::array<glm::vec3, 8> world_corners;
-
-    for (int i = 0; i < 8; i++) {
-        world_corners[i] =
-            glm::vec3(
-                model_matrix *
-                glm::vec4(
-                    local_corners[i],
-                    1.0f));
+    if (area < 0.0f) {
+        std::swap(v1, v2);
+        area = -area;
     }
 
-    constexpr int edges[12][2] = {
-        {0, 1}, {1, 2}, {2, 3}, {3, 0},
-        {4, 5}, {5, 6}, {6, 7}, {7, 4},
-        {0, 4}, {1, 5}, {2, 6}, {3, 7}
-    };
+    int minimum_x;
+    int maximum_x;
+    int minimum_y;
+    int maximum_y;
 
-    uint32_t color =
-        MFB_RGB(255, 230, 80);
+    triangle_bounds(
+        v0,
+        v1,
+        v2,
+        minimum_x,
+        maximum_x,
+        minimum_y,
+        maximum_y);
 
-    for (const auto &edge : edges) {
-        draw_projected_line(
-            world_corners[edge[0]],
-            world_corners[edge[1]],
-            view_matrix,
-            projection_matrix,
-            color);
-    }
-}
+    bool edge0_top_left =
+        is_top_left(v1, v2);
 
-void draw_face_normals(
-    const Mesh &mesh,
-    const glm::mat4 &view_matrix,
-    const glm::mat4 &projection_matrix) {
+    bool edge1_top_left =
+        is_top_left(v2, v0);
 
-    glm::mat4 model_matrix =
-        create_model_matrix(mesh);
+    bool edge2_top_left =
+        is_top_left(v0, v1);
 
-    glm::mat3 normal_matrix =
-        glm::transpose(
-            glm::inverse(
-                glm::mat3(model_matrix)));
+    for (int y = minimum_y;
+         y <= maximum_y;
+         y++) {
 
-    constexpr float normal_length = 0.35f;
+        for (int x = minimum_x;
+             x <= maximum_x;
+             x++) {
 
-    for (std::size_t i = 0;
-         i < mesh.faces.size();
-         i++) {
+            float pixel_x =
+                static_cast<float>(x) +
+                0.5f;
 
-        const Face &face =
-            mesh.faces[i];
+            float pixel_y =
+                static_cast<float>(y) +
+                0.5f;
 
-        glm::vec3 local_center =
-            (
-                mesh.vertices[face.a] +
-                mesh.vertices[face.b] +
-                mesh.vertices[face.c]
-            ) / 3.0f;
+            float weight0 =
+                edge_function(
+                    v1,
+                    v2,
+                    pixel_x,
+                    pixel_y);
 
-        glm::vec3 world_center =
-            glm::vec3(
-                model_matrix *
-                glm::vec4(
-                    local_center,
-                    1.0f));
+            float weight1 =
+                edge_function(
+                    v2,
+                    v0,
+                    pixel_x,
+                    pixel_y);
 
-        glm::vec3 world_normal =
-            normal_matrix *
-            mesh.face_normals[i];
+            float weight2 =
+                edge_function(
+                    v0,
+                    v1,
+                    pixel_x,
+                    pixel_y);
 
-        if (glm::length(world_normal) >
-            0.0001f) {
+            bool inside0 =
+                edge_inside(
+                    weight0,
+                    edge0_top_left,
+                    use_top_left_rule);
 
-            world_normal =
-                glm::normalize(world_normal);
+            bool inside1 =
+                edge_inside(
+                    weight1,
+                    edge1_top_left,
+                    use_top_left_rule);
+
+            bool inside2 =
+                edge_inside(
+                    weight2,
+                    edge2_top_left,
+                    use_top_left_rule);
+
+            if (!inside0 ||
+                !inside1 ||
+                !inside2) {
+
+                continue;
+            }
+
+            float alpha =
+                weight0 / area;
+
+            float beta =
+                weight1 / area;
+
+            float gamma =
+                weight2 / area;
+
+            float depth =
+                alpha * v0.z +
+                beta * v1.z +
+                gamma * v2.z;
+
+            int index =
+                y * WIDTH + x;
+
+            if (use_z_buffer) {
+                if (depth >=
+                    g_z_buffer[index]) {
+
+                    continue;
+                }
+
+                g_z_buffer[index] =
+                    depth;
+            }
+
+            g_buffer[index] =
+                color;
         }
-
-        glm::vec3 end =
-            world_center +
-            world_normal *
-            normal_length;
-
-        draw_projected_line(
-            world_center,
-            end,
-            view_matrix,
-            projection_matrix,
-            MFB_RGB(255, 120, 255));
     }
 }
 
-void draw_vertex_normals(
-    const Mesh &mesh,
-    const glm::mat4 &view_matrix,
-    const glm::mat4 &projection_matrix) {
+// ============================================================
+// Backface culling
+// ============================================================
 
-    glm::mat4 model_matrix =
-        create_model_matrix(mesh);
+bool is_back_facing(
+    const RasterVertex &v0,
+    const RasterVertex &v1,
+    const RasterVertex &v2) {
 
-    glm::mat3 normal_matrix =
-        glm::transpose(
-            glm::inverse(
-                glm::mat3(model_matrix)));
+    glm::vec3 edge1 =
+        v1.view_position -
+        v0.view_position;
 
-    constexpr float normal_length = 0.28f;
+    glm::vec3 edge2 =
+        v2.view_position -
+        v0.view_position;
 
-    for (std::size_t i = 0;
-         i < mesh.vertices.size();
-         i++) {
+    glm::vec3 normal =
+        glm::cross(
+            edge1,
+            edge2);
 
-        glm::vec3 world_vertex =
-            glm::vec3(
-                model_matrix *
-                glm::vec4(
-                    mesh.vertices[i],
-                    1.0f));
+    if (glm::length(normal) <
+        EPSILON) {
 
-        glm::vec3 world_normal =
-            normal_matrix *
-            mesh.vertex_normals[i];
-
-        if (glm::length(world_normal) >
-            0.0001f) {
-
-            world_normal =
-                glm::normalize(world_normal);
-        }
-
-        glm::vec3 end =
-            world_vertex +
-            world_normal *
-            normal_length;
-
-        draw_projected_line(
-            world_vertex,
-            end,
-            view_matrix,
-            projection_matrix,
-            MFB_RGB(80, 255, 255));
+        return true;
     }
+
+    glm::vec3 center =
+        (
+            v0.view_position +
+            v1.view_position +
+            v2.view_position
+        ) / 3.0f;
+
+    glm::vec3 direction_to_camera =
+        -center;
+
+    float result =
+        glm::dot(
+            normal,
+            direction_to_camera);
+
+    return result <= 0.0f;
 }
 
 // ============================================================
@@ -1033,19 +1041,21 @@ void draw_vertex_normals(
 
 void render_mesh(
     const Mesh &mesh,
-    const glm::mat4 &view_matrix,
-    const glm::mat4 &projection_matrix) {
+    int mesh_index,
+    const glm::mat4 &view,
+    const glm::mat4 &projection,
+    bool show_boxes,
+    bool use_z_buffer,
+    bool use_backface_culling,
+    bool use_top_left_rule,
+    bool show_wireframe) {
 
-    if (mesh.vertices.empty() ||
-        mesh.faces.empty()) {
+    glm::mat4 model =
+        model_matrix(mesh);
 
-        return;
-    }
+    std::vector<glm::vec3>
+        world_vertices;
 
-    glm::mat4 model_matrix =
-        create_model_matrix(mesh);
-
-    std::vector<glm::vec3> world_vertices;
     world_vertices.reserve(
         mesh.vertices.size());
 
@@ -1054,77 +1064,208 @@ void render_mesh(
 
         world_vertices.push_back(
             glm::vec3(
-                model_matrix *
-                glm::vec4(vertex, 1.0f)));
+                model *
+                glm::vec4(
+                    vertex,
+                    1.0f)));
     }
 
-    for (const Face &face : mesh.faces) {
-        draw_projected_line(
-            world_vertices[face.a],
-            world_vertices[face.b],
-            view_matrix,
-            projection_matrix,
-            mesh.color);
+    for (std::size_t i = 0;
+         i < mesh.faces.size();
+         i++) {
 
-        draw_projected_line(
-            world_vertices[face.b],
-            world_vertices[face.c],
-            view_matrix,
-            projection_matrix,
-            mesh.color);
+        const Face &face =
+            mesh.faces[i];
 
-        draw_projected_line(
-            world_vertices[face.c],
-            world_vertices[face.a],
-            view_matrix,
-            projection_matrix,
-            mesh.color);
+        RasterVertex v0 =
+            project_vertex(
+                world_vertices[face.a],
+                view,
+                projection);
+
+        RasterVertex v1 =
+            project_vertex(
+                world_vertices[face.b],
+                view,
+                projection);
+
+        RasterVertex v2 =
+            project_vertex(
+                world_vertices[face.c],
+                view,
+                projection);
+
+        if (!v0.valid ||
+            !v1.valid ||
+            !v2.valid) {
+
+            continue;
+        }
+
+        if (use_backface_culling &&
+            is_back_facing(
+                v0,
+                v1,
+                v2)) {
+
+            continue;
+        }
+
+        uint32_t color =
+            face_color(
+                mesh_index,
+                static_cast<int>(i));
+
+        if (show_boxes) {
+            draw_triangle_bounding_box(
+                v0,
+                v1,
+                v2,
+                color);
+        } else {
+            rasterize_triangle(
+                v0,
+                v1,
+                v2,
+                color,
+                use_z_buffer,
+                use_top_left_rule);
+        }
+
+        if (show_wireframe) {
+            uint32_t white =
+                MFB_RGB(
+                    255,
+                    255,
+                    255);
+
+            draw_line(
+                static_cast<int>(v0.x),
+                static_cast<int>(v0.y),
+                static_cast<int>(v1.x),
+                static_cast<int>(v1.y),
+                white);
+
+            draw_line(
+                static_cast<int>(v1.x),
+                static_cast<int>(v1.y),
+                static_cast<int>(v2.x),
+                static_cast<int>(v2.y),
+                white);
+
+            draw_line(
+                static_cast<int>(v2.x),
+                static_cast<int>(v2.y),
+                static_cast<int>(v0.x),
+                static_cast<int>(v0.y),
+                white);
+        }
     }
 }
 
 // ============================================================
-// Reset functions
+// Depth map
 // ============================================================
 
-void reset_transform(
-    TransformState &transform) {
+void draw_depth_map() {
+    float minimum_depth =
+        std::numeric_limits<float>
+            ::infinity();
 
-    transform.local_translation =
-        glm::vec3(0.0f);
+    float maximum_depth =
+        -std::numeric_limits<float>
+            ::infinity();
 
-    transform.local_rotation =
-        glm::vec3(0.0f);
+    for (int y = 0;
+         y < HEIGHT;
+         y++) {
 
-    transform.local_scale =
-        glm::vec3(1.0f);
+        for (int x = UI_WIDTH + 2;
+             x < WIDTH;
+             x++) {
 
-    transform.world_translation =
-        glm::vec3(0.0f);
+            float depth =
+                g_z_buffer[
+                    y * WIDTH + x];
 
-    transform.world_rotation =
-        glm::vec3(0.0f);
+            if (!std::isfinite(depth)) {
+                continue;
+            }
 
-    transform.world_scale =
-        glm::vec3(1.0f);
-}
+            minimum_depth =
+                std::min(
+                    minimum_depth,
+                    depth);
 
-void reset_camera(Camera &camera) {
-    camera.position =
-        glm::vec3(0.0f, 0.0f, 7.0f);
+            maximum_depth =
+                std::max(
+                    maximum_depth,
+                    depth);
+        }
+    }
 
-    camera.rotation =
-        glm::vec3(0.0f);
+    if (!std::isfinite(minimum_depth) ||
+        !std::isfinite(maximum_depth)) {
 
-    camera.target =
-        glm::vec3(0.0f);
+        return;
+    }
 
-    camera.field_of_view = 60.0f;
+    float range =
+        maximum_depth -
+        minimum_depth;
 
-    camera.use_look_at = false;
-    camera.use_perspective = true;
+    if (range < EPSILON) {
+        range = 1.0f;
+    }
 
-    camera.dolly_zoom_enabled = false;
-    camera.dolly_zoom_value = 0.0f;
+    for (int y = 0;
+         y < HEIGHT;
+         y++) {
+
+        for (int x = UI_WIDTH + 2;
+             x < WIDTH;
+             x++) {
+
+            int index =
+                y * WIDTH + x;
+
+            float depth =
+                g_z_buffer[index];
+
+            if (!std::isfinite(depth)) {
+                g_buffer[index] =
+                    MFB_RGB(
+                        5,
+                        5,
+                        5);
+
+                continue;
+            }
+
+            float normalized =
+                (depth -
+                 minimum_depth) /
+                range;
+
+            normalized =
+                std::clamp(
+                    normalized,
+                    0.0f,
+                    1.0f);
+
+            uint8_t gray =
+                static_cast<uint8_t>(
+                    (1.0f -
+                     normalized) *
+                    255.0f);
+
+            g_buffer[index] =
+                MFB_RGB(
+                    gray,
+                    gray,
+                    gray);
+        }
+    }
 }
 
 // ============================================================
@@ -1135,12 +1276,12 @@ void gui_label(
     mu_Context *ctx,
     const char *text) {
 
-    int width[] = {-1};
+    int widths[] = {-1};
 
     mu_layout_row(
         ctx,
         1,
-        width,
+        widths,
         0);
 
     mu_label(ctx, text);
@@ -1153,7 +1294,8 @@ void gui_slider(
     float minimum,
     float maximum) {
 
-    int widths[] = {150, -1};
+    int widths[] =
+        {145, -1};
 
     mu_layout_row(
         ctx,
@@ -1170,101 +1312,33 @@ void gui_slider(
         maximum);
 }
 
-void draw_transform_controls(
-    mu_Context *ctx,
+void reset_transform(
     TransformState &transform) {
 
-    gui_label(
-        ctx,
-        "LOCAL TRANSFORMATIONS");
+    transform.translation =
+        glm::vec3(0.0f);
 
-    gui_slider(
-        ctx,
-        "Local Translate X",
-        transform.local_translation.x,
-        -2.5f,
-        2.5f);
+    transform.rotation =
+        glm::vec3(0.0f);
 
-    gui_slider(
-        ctx,
-        "Local Translate Y",
-        transform.local_translation.y,
-        -2.5f,
-        2.5f);
+    transform.scale =
+        glm::vec3(1.0f);
+}
 
-    gui_slider(
-        ctx,
-        "Local Translate Z",
-        transform.local_translation.z,
-        -2.5f,
-        2.5f);
+void reset_camera(
+    Camera &camera) {
 
-    gui_slider(
-        ctx,
-        "Local Rotate X",
-        transform.local_rotation.x,
-        -180.0f,
-        180.0f);
+    camera.position =
+        glm::vec3(
+            0.0f,
+            0.0f,
+            7.0f);
 
-    gui_slider(
-        ctx,
-        "Local Rotate Y",
-        transform.local_rotation.y,
-        -180.0f,
-        180.0f);
+    camera.field_of_view =
+        60.0f;
 
-    gui_slider(
-        ctx,
-        "Local Rotate Z",
-        transform.local_rotation.z,
-        -180.0f,
-        180.0f);
-
-    gui_label(
-        ctx,
-        "WORLD TRANSFORMATIONS");
-
-    gui_slider(
-        ctx,
-        "World Translate X",
-        transform.world_translation.x,
-        -3.0f,
-        3.0f);
-
-    gui_slider(
-        ctx,
-        "World Translate Y",
-        transform.world_translation.y,
-        -3.0f,
-        3.0f);
-
-    gui_slider(
-        ctx,
-        "World Translate Z",
-        transform.world_translation.z,
-        -3.0f,
-        3.0f);
-
-    gui_slider(
-        ctx,
-        "World Rotate X",
-        transform.world_rotation.x,
-        -180.0f,
-        180.0f);
-
-    gui_slider(
-        ctx,
-        "World Rotate Y",
-        transform.world_rotation.y,
-        -180.0f,
-        180.0f);
-
-    gui_slider(
-        ctx,
-        "World Rotate Z",
-        transform.world_rotation.z,
-        -180.0f,
-        180.0f);
+    camera.perspective =
+        true;
 }
 
 // ============================================================
@@ -1272,22 +1346,24 @@ void draw_transform_controls(
 // ============================================================
 
 int main() {
-    create_default_obj_files();
+    create_default_models();
 
     std::vector<Mesh> meshes;
 
     Mesh cube;
     cube.name = "Cube";
-    cube.color = MFB_RGB(255, 120, 120);
 
     if (load_obj(
             "models/cube.obj",
             cube)) {
 
-        cube.transform.world_translation.x =
-            -1.35f;
+        cube.transform.translation =
+            glm::vec3(
+                -1.35f,
+                -0.35f,
+                0.0f);
 
-        cube.transform.local_rotation =
+        cube.transform.rotation =
             glm::vec3(
                 20.0f,
                 30.0f,
@@ -1298,16 +1374,18 @@ int main() {
 
     Mesh pyramid;
     pyramid.name = "Pyramid";
-    pyramid.color = MFB_RGB(120, 255, 160);
 
     if (load_obj(
             "models/pyramid.obj",
             pyramid)) {
 
-        pyramid.transform.world_translation.x =
-            1.35f;
+        pyramid.transform.translation =
+            glm::vec3(
+                1.35f,
+                -0.35f,
+                0.0f);
 
-        pyramid.transform.local_rotation =
+        pyramid.transform.rotation =
             glm::vec3(
                 15.0f,
                 -25.0f,
@@ -1317,27 +1395,34 @@ int main() {
     }
 
     Mesh octahedron;
-    octahedron.name = "Octahedron";
-    octahedron.color =
-        MFB_RGB(120, 180, 255);
+    octahedron.name =
+        "Octahedron";
 
     if (load_obj(
             "models/octahedron.obj",
             octahedron)) {
 
-        octahedron.transform
-            .world_translation.y =
-            1.35f;
+        octahedron.transform.translation =
+            glm::vec3(
+                0.0f,
+                1.35f,
+                0.0f);
 
-        octahedron.transform.local_scale =
+        octahedron.transform.scale =
             glm::vec3(0.65f);
+
+        octahedron.transform.rotation =
+            glm::vec3(
+                20.0f,
+                25.0f,
+                0.0f);
 
         meshes.push_back(octahedron);
     }
 
     if (meshes.empty()) {
         std::printf(
-            "No OBJ models were loaded.\n");
+            "No models loaded\n");
 
         return 1;
     }
@@ -1346,15 +1431,16 @@ int main() {
 
     int active_model = 0;
 
-    int show_world_axes = 1;
-    int show_local_axes = 1;
-    int show_bounding_box = 0;
-    int show_face_normals = 0;
-    int show_vertex_normals = 0;
+    int show_triangle_boxes = 0;
+    int use_z_buffer = 1;
+    int show_depth_map = 0;
+    int use_backface_culling = 0;
+    int use_top_left_rule = 1;
+    int show_wireframe = 0;
 
     struct mfb_window *window =
         mfb_open_ex(
-            "Assignment 3 - Virtual Cameras",
+            "Assignment 4 - Triangle Rasterization",
             WIDTH,
             HEIGHT,
             MFB_WF_RESIZABLE);
@@ -1382,12 +1468,13 @@ int main() {
 
             (void)font;
 
-            return (
-                       length < 0
-                           ? static_cast<int>(
-                                 std::strlen(text))
-                           : length) *
-                   8;
+            return
+                (
+                    length < 0
+                        ? static_cast<int>(
+                              std::strlen(text))
+                        : length
+                ) * 8;
         };
 
     ctx->text_height =
@@ -1413,11 +1500,8 @@ int main() {
 
     bool quit_requested = false;
 
-    bool previous_left_down = false;
-    bool previous_right_down = false;
-
     bool rotating_model = false;
-    bool moving_camera = false;
+    bool previous_left_down = false;
 
     int previous_mouse_x = 0;
     int previous_mouse_y = 0;
@@ -1426,27 +1510,15 @@ int main() {
         mfb_update_events(window) !=
         MFB_STATE_EXIT) {
 
-        ui_bridge_input(ctx, window);
+        ui_bridge_input(
+            ctx,
+            window);
 
         Mesh &active_mesh =
             meshes[active_model];
 
         const uint8_t *keys =
             mfb_get_key_buffer(window);
-
-        bool mouse_inside_scene =
-            ctx->mouse_pos.x > UI_WIDTH &&
-            ctx->mouse_pos.x < WIDTH &&
-            ctx->mouse_pos.y >= 0 &&
-            ctx->mouse_pos.y < HEIGHT;
-
-        bool left_down =
-            (ctx->mouse_down &
-             MU_MOUSE_LEFT) != 0;
-
-        bool right_down =
-            (ctx->mouse_down &
-             MU_MOUSE_RIGHT) != 0;
 
         constexpr float camera_speed =
             0.035f;
@@ -1481,6 +1553,19 @@ int main() {
                 camera_speed;
         }
 
+        bool mouse_inside_scene =
+            ctx->mouse_pos.x >
+                UI_WIDTH &&
+            ctx->mouse_pos.x <
+                WIDTH &&
+            ctx->mouse_pos.y >= 0 &&
+            ctx->mouse_pos.y <
+                HEIGHT;
+
+        bool left_down =
+            (ctx->mouse_down &
+             MU_MOUSE_LEFT) != 0;
+
         if (left_down &&
             !previous_left_down &&
             mouse_inside_scene) {
@@ -1510,61 +1595,16 @@ int main() {
                 previous_mouse_y;
 
             active_mesh.transform
-                .local_rotation.y +=
+                .rotation.y +=
                 static_cast<float>(
                     delta_x) *
                 0.55f;
 
             active_mesh.transform
-                .local_rotation.x +=
+                .rotation.x +=
                 static_cast<float>(
                     delta_y) *
                 0.55f;
-
-            previous_mouse_x =
-                ctx->mouse_pos.x;
-
-            previous_mouse_y =
-                ctx->mouse_pos.y;
-        }
-
-        if (right_down &&
-            !previous_right_down &&
-            mouse_inside_scene) {
-
-            moving_camera = true;
-
-            previous_mouse_x =
-                ctx->mouse_pos.x;
-
-            previous_mouse_y =
-                ctx->mouse_pos.y;
-        }
-
-        if (!right_down) {
-            moving_camera = false;
-        }
-
-        if (moving_camera &&
-            right_down) {
-
-            int delta_x =
-                ctx->mouse_pos.x -
-                previous_mouse_x;
-
-            int delta_y =
-                ctx->mouse_pos.y -
-                previous_mouse_y;
-
-            camera.position.x -=
-                static_cast<float>(
-                    delta_x) *
-                0.01f;
-
-            camera.position.y +=
-                static_cast<float>(
-                    delta_y) *
-                0.01f;
 
             previous_mouse_x =
                 ctx->mouse_pos.x;
@@ -1576,65 +1616,43 @@ int main() {
         previous_left_down =
             left_down;
 
-        previous_right_down =
-            right_down;
+        glm::mat4 view =
+            view_matrix(camera);
 
-        apply_dolly_zoom(camera);
-
-        glm::mat4 view_matrix =
-            create_view_matrix(camera);
-
-        glm::mat4 projection_matrix =
-            create_projection_matrix(camera);
+        glm::mat4 projection =
+            projection_matrix(camera);
 
         clear_background();
+        clear_z_buffer();
 
-        if (show_world_axes != 0) {
-            draw_world_axes(
-                view_matrix,
-                projection_matrix);
-        }
+        for (std::size_t i = 0;
+             i < meshes.size();
+             i++) {
 
-        for (const Mesh &mesh : meshes) {
             render_mesh(
-                mesh,
-                view_matrix,
-                projection_matrix);
+                meshes[i],
+                static_cast<int>(i),
+                view,
+                projection,
+                show_triangle_boxes != 0,
+                use_z_buffer != 0,
+                use_backface_culling != 0,
+                use_top_left_rule != 0,
+                show_wireframe != 0);
         }
 
-        if (show_local_axes != 0) {
-            draw_local_axes(
-                active_mesh,
-                view_matrix,
-                projection_matrix);
-        }
+        if (show_depth_map != 0 &&
+            use_z_buffer != 0 &&
+            show_triangle_boxes == 0) {
 
-        if (show_bounding_box != 0) {
-            draw_bounding_box(
-                active_mesh,
-                view_matrix,
-                projection_matrix);
-        }
-
-        if (show_face_normals != 0) {
-            draw_face_normals(
-                active_mesh,
-                view_matrix,
-                projection_matrix);
-        }
-
-        if (show_vertex_normals != 0) {
-            draw_vertex_normals(
-                active_mesh,
-                view_matrix,
-                projection_matrix);
+            draw_depth_map();
         }
 
         mu_begin(ctx);
 
         if (mu_begin_window(
                 ctx,
-                "Virtual Camera Controls",
+                "Rasterization Controls",
                 mu_rect(
                     15,
                     15,
@@ -1651,14 +1669,13 @@ int main() {
 
             mu_label(
                 ctx,
-                "Assignment 3: Cameras and Projections");
+                "Assignment 4: Triangle Rasterization");
 
             mu_text(
                 ctx,
-                "Left drag rotates the active model. "
-                "Right drag moves the camera. "
-                "Arrow keys move camera X/Y. "
-                "W and S move camera Z.");
+                "Left drag rotates the selected model. "
+                "Arrow keys move the camera. "
+                "W and S move the camera forward and backward.");
 
             gui_label(
                 ctx,
@@ -1673,7 +1690,10 @@ int main() {
                 model_widths,
                 0);
 
-            if (mu_button(ctx, "Cube")) {
+            if (mu_button(
+                    ctx,
+                    "Cube")) {
+
                 active_model = 0;
             }
 
@@ -1685,7 +1705,9 @@ int main() {
                     active_model = 1;
                 }
             } else {
-                mu_label(ctx, "Unavailable");
+                mu_label(
+                    ctx,
+                    "Unavailable");
             }
 
             if (meshes.size() > 2) {
@@ -1696,7 +1718,9 @@ int main() {
                     active_model = 2;
                 }
             } else {
-                mu_label(ctx, "Unavailable");
+                mu_label(
+                    ctx,
+                    "Unavailable");
             }
 
             Mesh &selected =
@@ -1719,63 +1743,28 @@ int main() {
             std::snprintf(
                 vertices_text,
                 sizeof(vertices_text),
-                "Number of vertices: %zu",
+                "Vertices: %zu",
                 selected.vertices.size());
 
             gui_label(
                 ctx,
                 vertices_text);
 
-            char faces_text[64];
+            char triangles_text[64];
 
             std::snprintf(
-                faces_text,
-                sizeof(faces_text),
-                "Number of faces: %zu",
+                triangles_text,
+                sizeof(triangles_text),
+                "Triangles: %zu",
                 selected.faces.size());
 
             gui_label(
                 ctx,
-                faces_text);
+                triangles_text);
 
             gui_label(
                 ctx,
-                "DEBUG VISUALIZATION");
-
-            int checkbox_widths[] =
-                {190, -1};
-
-            mu_layout_row(
-                ctx,
-                2,
-                checkbox_widths,
-                0);
-
-            mu_checkbox(
-                ctx,
-                "World Axes",
-                &show_world_axes);
-
-            mu_checkbox(
-                ctx,
-                "Local Axes",
-                &show_local_axes);
-
-            mu_layout_row(
-                ctx,
-                2,
-                checkbox_widths,
-                0);
-
-            mu_checkbox(
-                ctx,
-                "Bounding Box",
-                &show_bounding_box);
-
-            mu_checkbox(
-                ctx,
-                "Face Normals",
-                &show_face_normals);
+                "RASTERIZATION MODES");
 
             mu_layout_row(
                 ctx,
@@ -1785,8 +1774,63 @@ int main() {
 
             mu_checkbox(
                 ctx,
-                "Vertex Normals",
-                &show_vertex_normals);
+                "Triangle Bounding Boxes",
+                &show_triangle_boxes);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Enable Z-Buffer",
+                &use_z_buffer);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Show Depth Map",
+                &show_depth_map);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Backface Culling",
+                &use_backface_culling);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Top-Left Fill Rule",
+                &use_top_left_rule);
+
+            mu_layout_row(
+                ctx,
+                1,
+                full_width,
+                0);
+
+            mu_checkbox(
+                ctx,
+                "Wireframe Overlay",
+                &show_wireframe);
 
             gui_label(
                 ctx,
@@ -1799,7 +1843,7 @@ int main() {
                 0);
 
             const char *projection_button =
-                camera.use_perspective
+                camera.perspective
                     ? "Switch to Orthographic"
                     : "Switch to Perspective";
 
@@ -1807,19 +1851,19 @@ int main() {
                     ctx,
                     projection_button)) {
 
-                camera.use_perspective =
-                    !camera.use_perspective;
+                camera.perspective =
+                    !camera.perspective;
             }
 
             gui_label(
                 ctx,
-                camera.use_perspective
+                camera.perspective
                     ? "Current: Perspective"
                     : "Current: Orthographic");
 
             gui_label(
                 ctx,
-                "CAMERA POSITION");
+                "CAMERA");
 
             gui_slider(
                 ctx,
@@ -1842,31 +1886,6 @@ int main() {
                 2.0f,
                 18.0f);
 
-            gui_label(
-                ctx,
-                "CAMERA ROTATION");
-
-            gui_slider(
-                ctx,
-                "Camera Rotate X",
-                camera.rotation.x,
-                -180.0f,
-                180.0f);
-
-            gui_slider(
-                ctx,
-                "Camera Rotate Y",
-                camera.rotation.y,
-                -180.0f,
-                180.0f);
-
-            gui_slider(
-                ctx,
-                "Camera Rotate Z",
-                camera.rotation.z,
-                -180.0f,
-                180.0f);
-
             gui_slider(
                 ctx,
                 "Field of View",
@@ -1876,79 +1895,62 @@ int main() {
 
             gui_label(
                 ctx,
-                "LOOKAT CAMERA");
-
-            int look_at_value =
-                camera.use_look_at ? 1 : 0;
-
-            mu_layout_row(
-                ctx,
-                1,
-                full_width,
-                0);
-
-            mu_checkbox(
-                ctx,
-                "Enable LookAt",
-                &look_at_value);
-
-            camera.use_look_at =
-                look_at_value != 0;
+                "MODEL TRANSFORMATIONS");
 
             gui_slider(
                 ctx,
-                "Target X",
-                camera.target.x,
-                -5.0f,
-                5.0f);
+                "Translate X",
+                selected.transform.translation.x,
+                -3.0f,
+                3.0f);
 
             gui_slider(
                 ctx,
-                "Target Y",
-                camera.target.y,
-                -5.0f,
-                5.0f);
+                "Translate Y",
+                selected.transform.translation.y,
+                -3.0f,
+                3.0f);
 
             gui_slider(
                 ctx,
-                "Target Z",
-                camera.target.z,
-                -5.0f,
-                5.0f);
-
-            gui_label(
-                ctx,
-                "DOLLY ZOOM");
-
-            int dolly_value =
-                camera.dolly_zoom_enabled
-                    ? 1
-                    : 0;
-
-            mu_layout_row(
-                ctx,
-                1,
-                full_width,
-                0);
-
-            mu_checkbox(
-                ctx,
-                "Enable Dolly Zoom",
-                &dolly_value);
-
-            camera.dolly_zoom_enabled =
-                dolly_value != 0;
+                "Translate Z",
+                selected.transform.translation.z,
+                -3.0f,
+                3.0f);
 
             gui_slider(
                 ctx,
-                "Dolly Amount",
-                camera.dolly_zoom_value,
-                -4.5f,
-                10.0f);
+                "Rotate X",
+                selected.transform.rotation.x,
+                -180.0f,
+                180.0f);
 
-            draw_transform_controls(
+            gui_slider(
                 ctx,
-                selected.transform);
+                "Rotate Y",
+                selected.transform.rotation.y,
+                -180.0f,
+                180.0f);
+
+            gui_slider(
+                ctx,
+                "Rotate Z",
+                selected.transform.rotation.z,
+                -180.0f,
+                180.0f);
+
+            gui_slider(
+                ctx,
+                "Scale",
+                selected.transform.scale.x,
+                0.2f,
+                2.5f);
+
+            selected.transform.scale.y =
+                selected.transform.scale.x;
+
+            selected.transform.scale.z =
+                selected.transform.scale.x;
 
             mu_layout_row(
                 ctx,
@@ -1990,30 +1992,53 @@ int main() {
                 reset_transform(
                     meshes[0].transform);
 
-                meshes[0].transform
-                    .world_translation.x =
-                    -1.35f;
+                meshes[0].transform.translation =
+                    glm::vec3(
+                        -1.35f,
+                        -0.35f,
+                        0.0f);
+
+                meshes[0].transform.rotation =
+                    glm::vec3(
+                        20.0f,
+                        30.0f,
+                        0.0f);
 
                 if (meshes.size() > 1) {
                     reset_transform(
                         meshes[1].transform);
 
-                    meshes[1].transform
-                        .world_translation.x =
-                        1.35f;
+                    meshes[1].transform.translation =
+                        glm::vec3(
+                            1.35f,
+                            -0.35f,
+                            0.0f);
+
+                    meshes[1].transform.rotation =
+                        glm::vec3(
+                            15.0f,
+                            -25.0f,
+                            0.0f);
                 }
 
                 if (meshes.size() > 2) {
                     reset_transform(
                         meshes[2].transform);
 
-                    meshes[2].transform
-                        .world_translation.y =
-                        1.35f;
+                    meshes[2].transform.translation =
+                        glm::vec3(
+                            0.0f,
+                            1.35f,
+                            0.0f);
 
-                    meshes[2].transform
-                        .local_scale =
+                    meshes[2].transform.scale =
                         glm::vec3(0.65f);
+
+                    meshes[2].transform.rotation =
+                        glm::vec3(
+                            20.0f,
+                            25.0f,
+                            0.0f);
                 }
             }
 
@@ -2023,7 +2048,10 @@ int main() {
                 full_width,
                 0);
 
-            if (mu_button(ctx, "Quit")) {
+            if (mu_button(
+                    ctx,
+                    "Quit")) {
+
                 quit_requested = true;
             }
 
